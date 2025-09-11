@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+azure-ai-projects
+azure-identity
+python-dotenv
+azure-storage-blob --pre

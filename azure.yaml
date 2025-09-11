@@ -1,0 +1,16 @@
+name: aifoundry-tutor
+services:
+  backend:
+    project: ./backend
+    language: python
+    host: containerapp
+    docker:
+      path: Dockerfile
+      registry: ${AZURE_CONTAINER_REGISTRY_ENDPOINT}
+  frontend:
+    project: ./frontend
+    language: python
+    host: appservice
+    docker:
+      path: Dockerfile
+      registry: ${AZURE_CONTAINER_REGISTRY_ENDPOINT}

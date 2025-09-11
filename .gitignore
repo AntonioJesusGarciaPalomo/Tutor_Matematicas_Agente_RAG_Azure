@@ -1,0 +1,10 @@
+# Azure Developer CLI
+.azure/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# VS Code
+.vscode/
