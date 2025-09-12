@@ -2,7 +2,7 @@ param acrName string
 param principalId string
 
 // ID del rol 'AcrPull'
-var acrPullRoleId = '7f951a01-0976-43fa-a27b-1753f3e1b08b'
+var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 
 // Obtiene una referencia al ACR que ya existe en el grupo de recursos
 resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
