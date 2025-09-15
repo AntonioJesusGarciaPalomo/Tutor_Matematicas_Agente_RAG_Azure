@@ -4,8 +4,8 @@ import os
 
 BACKEND_URL = os.environ.get("BACKEND_URI")
 
-# ... (start_new_chat sigue igual)
 def start_new_chat():
+
     try:
         response = requests.post(f"{BACKEND_URL}/start_chat")
         response.raise_for_status()
@@ -14,7 +14,7 @@ def start_new_chat():
         return f"Error starting new chat: {e}"
 
 def chat_interface(message, history, thread_id_state):
-    # ... (código de inicialización y llamada a la API sin cambios)
+    
     if not thread_id_state:
         thread_id_state = start_new_chat()
         if "Error" in thread_id_state:
