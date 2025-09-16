@@ -1,4 +1,4 @@
-param location string
+param location string = 'swedencentral'
 param appServicePlanName string = 'plan-tutor-frontend-${uniqueString(resourceGroup().id)}'
 param webAppName string = 'app-tutor-frontend-${uniqueString(resourceGroup().id)}'
 
@@ -27,6 +27,12 @@ resource webApp 'Microsoft.Web/sites@2022-09-01' = {
     siteConfig: {
       linuxFxVersion: 'PYTHON|3.12' // Especifica la versión de Python
       ftpsState: 'FtpsOnly'
+      appSettings: [
+        {
+          name: 'WEBSITES_PORT'
+          value: '7860' // Informa a App Service del puerto de Gradio
+        }
+      ]
     }
   }
 }
