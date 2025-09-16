@@ -219,13 +219,13 @@ Las contribuciones son bienvenidas. Sigue estos pasos:
    ```
 5. Abre un Pull Request
 
-### Guía de Estilo �
+### Guía de Estilo 
 - Sigue PEP 8 para código Python
 - Documenta las nuevas funciones y clases
 - Añade pruebas unitarias para nuevas características
 - Mantén el estilo de código existente
 
-## �📄 Licencia
+## 📄 Licencia
 
 Este proyecto está licenciado bajo la Licencia MIT - ver el archivo [LICENSE](LICENSE) para más detalles.
 

@@ -15,7 +15,7 @@ resource rg 'Microsoft.Resources/resourceGroups@2022-09-01' = {
   location: location
 }
 
-// --- MÓDULOS DE DEPENDENCIAS PARA EL HUB ---
+// --- MODULOS DE DEPENDENCIAS PARA EL HUB ---
 module kv 'modules/key_vault.bicep' = {
   scope: rg
   name: 'keyVaultDeploy'
