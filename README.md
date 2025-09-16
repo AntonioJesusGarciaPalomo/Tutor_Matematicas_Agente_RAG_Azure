@@ -241,5 +241,5 @@ Este proyecto está licenciado bajo la Licencia MIT - ver el archivo [LICENSE](L
 ---
 
 <div align="center">
-  <sub>Desarrollado con ❤️ por el equipo de AI Foundry</sub>
+  <sub>Desarrollado con ❤️ por el equipo MS Data</sub>
 </div>
