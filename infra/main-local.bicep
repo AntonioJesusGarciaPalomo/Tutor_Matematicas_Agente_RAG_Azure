@@ -129,7 +129,19 @@ module aiProject 'modules-local/ai-project.bicep' = {
   }
 }
 
-// Outputs - These will be used by azd to populate environment variables
+// Outputs - Using AZURE_ prefix for azd to recognize them automatically
+output AZURE_PROJECT_ENDPOINT string = aiProject.outputs.endpoint
+output AZURE_STORAGE_ACCOUNT_NAME string = storage.outputs.name
+output AZURE_STORAGE_ACCOUNT_KEY string = storage.outputs.key
+output AZURE_STORAGE_CONNECTION_STRING string = storage.outputs.connectionString
+output AZURE_KEY_VAULT_NAME string = keyVault.outputs.name
+output AZURE_KEY_VAULT_ENDPOINT string = keyVault.outputs.endpoint
+output AZURE_AI_HUB_NAME string = aiHub.outputs.name
+output AZURE_AI_PROJECT_NAME string = aiProject.outputs.name
+output AZURE_APPLICATION_INSIGHTS_CONNECTION_STRING string = appInsights.outputs.connectionString
+output AZURE_RESOURCE_GROUP_NAME string = rg.name
+
+// Legacy outputs for backward compatibility
 output PROJECT_ENDPOINT string = aiProject.outputs.endpoint
 output STORAGE_ACCOUNT_NAME string = storage.outputs.name
 output STORAGE_ACCOUNT_KEY string = storage.outputs.key

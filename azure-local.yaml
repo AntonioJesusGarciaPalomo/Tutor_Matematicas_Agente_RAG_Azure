@@ -5,8 +5,11 @@ metadata:
   template: aifoundry-agent-local-dev@1.0.0
   description: Minimal Azure resources for local development of Math Tutor
 
-# No services to deploy - we run everything locally
-# We only provision Azure resources (AI Hub, Storage)
+# We only provision Azure some resources (AI Hub, Storage)
+infra:
+  provider: bicep
+  path: infra
+  module: main-local
 
 # Environment variables that will be set after provisioning
 environment:
