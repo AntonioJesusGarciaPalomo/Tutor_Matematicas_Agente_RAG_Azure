@@ -143,7 +143,7 @@ class LocalDevSetup:
         prerequisites = [
             ("Python 3.12+", [self.python_cmd, "--version"], False),
             ("pip", [self.python_cmd, "-m", "pip", "--version"], False),
-            ("Azure CLI", ["az", "--version"], False),
+            ("Azure CLI", ["az", "--version"], True),
             ("Docker", ["docker", "--version"], True),  # opcional
             ("Make", ["make", "--version"], True),  # opcional
         ]
