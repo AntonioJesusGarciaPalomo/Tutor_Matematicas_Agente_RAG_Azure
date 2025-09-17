@@ -1,6 +1,7 @@
 param location string = 'swedencentral'
 param appServicePlanName string = 'plan-tutor-frontend-${uniqueString(resourceGroup().id)}'
 param webAppName string = 'app-tutor-frontend-${uniqueString(resourceGroup().id)}'
+param backendUri string
 
 // App Service Plan (la infraestructura subyacente de la Web App)
 resource appServicePlan 'Microsoft.Web/serverfarms@2022-09-01' = {
@@ -31,6 +32,10 @@ resource webApp 'Microsoft.Web/sites@2022-09-01' = {
         {
           name: 'WEBSITES_PORT'
           value: '7860' // Informa a App Service del puerto de Gradio
+        }
+        {
+          name: 'BACKEND_URI'
+          value: backendUri // Inyecta la URL del backend directamente
         }
       ]
     }

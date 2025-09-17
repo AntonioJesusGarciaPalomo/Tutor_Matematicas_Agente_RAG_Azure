@@ -1,16 +1,52 @@
 name: aifoundry-tutor
+metadata:
+  template: aifoundry-agent-tutor@1.0.0
 services:
   backend:
     project: ./backend
     language: python
     host: containerapp
     docker:
-      path: Dockerfile
+      # Las propiedades 'path' y 'context' se han eliminado para usar las convenciones de azd
       registry: ${AZURE_CONTAINER_REGISTRY_ENDPOINT}
+    env:
+      PROJECT_ENDPOINT: ${PROJECT_ENDPOINT}
+      MODEL_DEPLOYMENT_NAME: ${MODEL_DEPLOYMENT_NAME}
+      STORAGE_ACCOUNT_NAME: ${STORAGE_ACCOUNT_NAME}
+      IMAGES_CONTAINER_NAME: ${IMAGES_CONTAINER_NAME}
+  
   frontend:
     project: ./frontend
     language: python
     host: appservice
     docker:
-      path: Dockerfile
+      # Las propiedades 'path' y 'context' se han eliminado para usar las convenciones de azd
       registry: ${AZURE_CONTAINER_REGISTRY_ENDPOINT}
+    env:
+      BACKEND_URI: ${BACKEND_URI}
+
+# Hooks para post-provisioning
+hooks:
+  postprovision:
+    windows:
+      shell: pwsh
+      run: |
+        Write-Host "Setting environment variables from infrastructure outputs..."
+        azd env set PROJECT_ENDPOINT $env:PROJECT_ENDPOINT
+        azd env set BACKEND_URI $env:BACKEND_URI
+        azd env set FRONTEND_URI $env:FRONTEND_URI
+        azd env set STORAGE_ACCOUNT_NAME $env:STORAGE_ACCOUNT_NAME
+        azd env set IMAGES_CONTAINER_NAME $env:IMAGES_CONTAINER_NAME
+        azd env set AZURE_CONTAINER_REGISTRY_ENDPOINT $env:AZURE_CONTAINER_REGISTRY_ENDPOINT
+        azd env set MODEL_DEPLOYMENT_NAME "gpt-4o"
+    posix:
+      shell: sh
+      run: |
+        echo "Setting environment variables from infrastructure outputs..."
+        azd env set PROJECT_ENDPOINT $PROJECT_ENDPOINT
+        azd env set BACKEND_URI $BACKEND_URI
+        azd env set FRONTEND_URI $FRONTEND_URI
+        azd env set STORAGE_ACCOUNT_NAME $STORAGE_ACCOUNT_NAME
+        azd env set IMAGES_CONTAINER_NAME $IMAGES_CONTAINER_NAME
+        azd env set AZURE_CONTAINER_REGISTRY_ENDPOINT $AZURE_CONTAINER_REGISTRY_ENDPOINT
+        azd env set MODEL_DEPLOYMENT_NAME "gpt-4o"

@@ -86,6 +86,7 @@ module webApp 'modules/web_app.bicep' = {
   name: 'webAppDeploy'
   params: {
     location: location
+    backendUri: containerApp.outputs.backendUri
   }
 }
 

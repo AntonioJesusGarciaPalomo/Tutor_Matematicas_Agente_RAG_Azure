@@ -1,3 +1,5 @@
+.env
+
 # Azure Developer CLI
 .azure/
 

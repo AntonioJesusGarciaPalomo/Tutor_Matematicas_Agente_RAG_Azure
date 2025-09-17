@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from azure.ai.projects import AIProjectClient
-from azure.identity import DefaultAzureCredential
+from azure.identity import DefaultAzureCredential, InteractiveBrowserCredential
 from azure.ai.agents.models import CodeInterpreterTool
 from azure.storage.blob import BlobServiceClient
 
@@ -14,26 +14,25 @@ load_dotenv()
 
 app = FastAPI()
 
-# --- NUEVAS CONFIGURACIONES ---
+# --- CONFIGURACIONES ---
 AGENT_NAME = "math-tutor-agent"
 storage_account_name = os.environ.get("STORAGE_ACCOUNT_NAME")
 images_container_name = os.environ.get("IMAGES_CONTAINER_NAME")
 
-# --- CREDENCIAL COMPARTIDA ---
-credential = DefaultAzureCredential()
+# --- CREDENCIAL (INTERACTIVA PARA LOCAL) ---
+credential = InteractiveBrowserCredential()
 
 # AI Project Client
 project_endpoint = os.environ.get("PROJECT_ENDPOINT")
 model_deployment_name = os.environ.get("MODEL_DEPLOYMENT_NAME")
 project_client = AIProjectClient(endpoint=project_endpoint, credential=credential)
 
-# --- NUEVO CLIENTE DE BLOB ---
+# Blob Storage Client
 blob_service_client = BlobServiceClient(
     account_url=f"https://{storage_account_name}.blob.core.windows.net",
     credential=credential
 )
 
-# ... (El resto del código de la API, como ChatRequest y ChatResponse, sigue igual)
 class ChatRequest(BaseModel):
     thread_id: str
     message: str
@@ -42,13 +41,14 @@ class ChatResponse(BaseModel):
     reply: str
     image_url: str | None = None
 
-# Funcion de comenzar chat
+# --- FUNCIÓN CORREGIDA ---
 @app.post("/start_chat", response_model=dict)
 def start_chat():
     try:
         code_interpreter = CodeInterpreterTool()
         with project_client:
-            agent = project_client.agents.create_or_update(
+            # CORRECCIÓN: Usamos 'create_agent' en lugar de 'create_or_update'
+            agent = project_client.agents.create_agent(
                 model=model_deployment_name,
                 name=AGENT_NAME,
                 instructions="You are a friendly math tutor. Use the Code Interpreter tool to visualize mathematical concepts when asked.",
@@ -57,6 +57,8 @@ def start_chat():
             thread = project_client.agents.threads.create()
             return {"thread_id": thread.id}
     except Exception as e:
+        # Añadimos un log más detallado para ver el error exacto
+        print(f"ERROR in start_chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/chat", response_model=ChatResponse)
@@ -88,17 +90,13 @@ def chat(request: ChatRequest):
             for message in reversed(messages):
                 if message.role == "assistant":
                     reply = message.content
-                    # --- LÓGICA DE GESTIÓN DE IMÁGENES ---
                     if message.image_contents:
-                        # Tomamos la primera imagen
                         img = message.image_contents[0]
                         file_id = img.image_file.file_id
                         
-                        # Descargamos el contenido del fichero
                         file_content_dict = project_client.agents.files.download(file_id=file_id)
                         image_bytes = file_content_dict['content']
 
-                        # Subimos a Blob Storage
                         blob_client = blob_service_client.get_blob_client(
                             container=images_container_name, 
                             blob=f"{file_id}.png"
@@ -108,10 +106,10 @@ def chat(request: ChatRequest):
                             blob_client.upload_blob(stream, overwrite=True)
                         
                         image_url = blob_client.url
-
-                    break # Salimos al encontrar la primera respuesta del asistente
+                    break
             
             return ChatResponse(reply=reply, image_url=image_url)
 
     except Exception as e:
+        print(f"ERROR in chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))
