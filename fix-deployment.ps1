@@ -159,25 +159,30 @@ try {
     # AI Project
     Show-Progress "Buscando AI Project"
     $aiProjects = az resource list --resource-group $ResourceGroup --resource-type "Microsoft.MachineLearningServices/workspaces" --query "[?kind=='Project']" -o json | ConvertFrom-Json
-    
+
     if ($aiProjects.Count -eq 0) {
         Handle-Error "No se encontró el AI Project"
     }
-    
+
     $aiProject = $aiProjects[0]
     $PROJECT_NAME = $aiProject.name
-    
-    # Obtener el endpoint completo del proyecto
-    $projectDetails = az ml workspace show --name $PROJECT_NAME --resource-group $ResourceGroup -o json 2>$null | ConvertFrom-Json
-    if ($projectDetails) {
-        $PROJECT_ENDPOINT = $projectDetails.properties.discoveryUrl
-    } else {
-        # Fallback al formato estándar
-        $PROJECT_ENDPOINT = "https://$PROJECT_NAME.api.azureml.ms"
+
+    # Obtener el hub asociado
+    $hubName = ($aiProject.name -replace "proj-tutor-", "hub-")
+
+    # Construir el endpoint correcto
+    # Formato: https://HUB_NAME.LOCATION.api.azureml.ms/discovery/workspaces/PROJECT_NAME
+    $location = $aiProject.location
+    $PROJECT_ENDPOINT = "https://${hubName}.${location}.api.azureml.ms/discovery/workspaces/${PROJECT_NAME}"
+
+    # Si eso no funciona, intentar el formato alternativo de AI Foundry
+    if (-not (Test-Connection -ComputerName "${hubName}.${location}.api.azureml.ms" -Count 1 -Quiet 2>$null)) {
+        $PROJECT_ENDPOINT = "https://${PROJECT_NAME}.services.ai.azure.com/api/projects/${PROJECT_NAME}"
     }
-    
+
     Show-Progress "AI Project encontrado" "Done"
     Write-Host "     • Nombre: $PROJECT_NAME" -ForegroundColor Gray
+    Write-Host "     • Hub: $hubName" -ForegroundColor Gray
     Write-Host "     • Endpoint: $PROJECT_ENDPOINT" -ForegroundColor Gray
     
     # Storage Account

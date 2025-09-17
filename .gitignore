@@ -10,3 +10,17 @@ __pycache__/
 
 # VS Code
 .vscode/
+
+# Archivos de entorno locales
+backend/.env
+frontend/.env
+
+# Logs
+*.log
+
+# Tests
+.pytest_cache/
+htmlcov/
+
+# Docker volumes
+.docker/

@@ -125,7 +125,7 @@ az-set-subscription: ## Configura la suscripción de Azure
 	@az account list --output table
 	@echo ""
 	@read -p "Ingresa el ID de la suscripción: " sub_id; \
-	az account set --subscription $sub_id
+	az account set --subscription $$sub_id
 	@echo "$(GREEN)✅ Suscripción configurada$(NC)"
 
 provision: ## Aprovisiona la infraestructura en Azure
