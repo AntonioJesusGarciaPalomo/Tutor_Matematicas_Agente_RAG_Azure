@@ -1,37 +1,73 @@
-import gradio as gr
-import requests
 import os
+import io
 import logging
 import time
-from typing import List, Tuple, Optional, Dict, Any
-from datetime import datetime
+from typing import Optional, Dict, Any
+from contextlib import contextmanager
 from functools import wraps
 
-# Configuración de logging mejorada
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from azure.ai.projects import AIProjectClient
+from azure.identity import (
+    DefaultAzureCredential, 
+    InteractiveBrowserCredential,
+    ChainedTokenCredential,
+    ManagedIdentityCredential,
+    AzureCliCredential
+)
+from azure.ai.agents.models import CodeInterpreterTool
+from azure.storage.blob import BlobServiceClient
+from azure.core.exceptions import ResourceNotFoundError, AzureError
+
+from dotenv import load_dotenv
+
+# Configurar logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Configuración del backend
-BACKEND_URL = os.environ.get("BACKEND_URI", "http://localhost:8000")
-BACKEND_URL = BACKEND_URL.rstrip('/')
+# Cargar variables de entorno
+load_dotenv()
 
-# Timeouts configurables
-STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "30"))
-CHAT_TIMEOUT = int(os.environ.get("CHAT_TIMEOUT", "60"))
-RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
+app = FastAPI(
+    title="Math Tutor Backend",
+    version="1.0.0",
+    description="AI-powered math tutor using Azure AI Foundry Agent Service"
+)
 
-logger.info("="*60)
-logger.info("Math Tutor Frontend Starting...")
-logger.info(f"Backend URL: {BACKEND_URL}")
-logger.info(f"Timeouts - Startup: {STARTUP_TIMEOUT}s, Chat: {CHAT_TIMEOUT}s")
-logger.info(f"Retry attempts: {RETRY_ATTEMPTS}")
-logger.info("="*60)
+# Agregar CORS para desarrollo local
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:7860", "http://127.0.0.1:7860", "*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def retry_on_error(max_attempts=3, delay=1, backoff=2):
-    """Decorador para reintentar operaciones en caso de error"""
+# --- CONFIGURACIONES ---
+AGENT_NAME = "math-tutor-agent"
+storage_account_name = os.environ.get("STORAGE_ACCOUNT_NAME")
+images_container_name = os.environ.get("IMAGES_CONTAINER_NAME", "images")
+project_endpoint = os.environ.get("PROJECT_ENDPOINT")
+model_deployment_name = os.environ.get("MODEL_DEPLOYMENT_NAME", "gpt-4o")
+
+# Detectar si estamos en local o en Azure
+IS_LOCAL = os.environ.get("AZURE_CLIENT_ID") is None
+
+logger.info(f"Running in {'LOCAL' if IS_LOCAL else 'AZURE'} mode")
+logger.info(f"Project endpoint: {project_endpoint}")
+logger.info(f"Storage account: {storage_account_name}")
+
+# --- DECORADOR PARA RETRY LOGIC ---
+def retry(max_attempts=3, delay=2, backoff=2, exceptions=(Exception,)):
+    """
+    Decorador para reintentar operaciones que pueden fallar
+    """
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -41,12 +77,12 @@ def retry_on_error(max_attempts=3, delay=1, backoff=2):
             while attempt <= max_attempts:
                 try:
                     return func(*args, **kwargs)
-                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                except exceptions as e:
                     if attempt == max_attempts:
                         logger.error(f"Failed after {max_attempts} attempts: {e}")
                         raise
                     
-                    logger.warning(f"Attempt {attempt}/{max_attempts} failed. Retrying in {current_delay}s...")
+                    logger.warning(f"Attempt {attempt}/{max_attempts} failed: {e}. Retrying in {current_delay}s...")
                     time.sleep(current_delay)
                     current_delay *= backoff
                     attempt += 1
@@ -55,508 +91,540 @@ def retry_on_error(max_attempts=3, delay=1, backoff=2):
         return wrapper
     return decorator
 
-class BackendClient:
-    """Cliente mejorado para comunicarse con el backend"""
-    
-    def __init__(self, base_url: str):
-        self.base_url = base_url
-        self.session = requests.Session()
-        self.session.headers.update({
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        })
-        self.is_healthy = False
-        self.health_info = {}
-        self.last_health_check = 0
-        self.health_check_interval = 30  # Verificar salud cada 30 segundos
-    
-    @retry_on_error(max_attempts=3, delay=1)
-    def check_health(self, force=False) -> bool:
-        """Verifica el estado del backend con cache"""
-        current_time = time.time()
-        
-        # Usar cache si no ha pasado mucho tiempo y no se fuerza
-        if not force and (current_time - self.last_health_check) < self.health_check_interval:
-            return self.is_healthy
-        
-        try:
-            response = self.session.get(
-                f"{self.base_url}/health",
-                timeout=5
-            )
-            if response.status_code == 200:
-                self.health_info = response.json()
-                self.is_healthy = True
-                self.last_health_check = current_time
-                logger.info(f"Backend health check passed: {self.health_info}")
-                return True
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            self.is_healthy = False
-            self.health_info = {"error": str(e)}
-        
-        return False
-    
-    def check_detailed_health(self) -> Dict[str, Any]:
-        """Obtiene información detallada de salud"""
-        try:
-            response = self.session.get(
-                f"{self.base_url}/health/detailed",
-                timeout=10
-            )
-            if response.status_code == 200:
-                return response.json()
-        except Exception as e:
-            logger.error(f"Detailed health check failed: {e}")
-        
-        return {
-            "status": "unknown",
-            "errors": ["Could not retrieve detailed health information"]
-        }
-    
-    @retry_on_error(max_attempts=RETRY_ATTEMPTS, delay=2)
-    def start_chat(self) -> str:
-        """Inicia una nueva sesión de chat con reintentos"""
-        try:
-            response = self.session.post(
-                f"{self.base_url}/start_chat",
-                timeout=STARTUP_TIMEOUT
-            )
-            response.raise_for_status()
-            data = response.json()
-            thread_id = data.get("thread_id")
-            agent_id = data.get("agent_id")
-            status = data.get("status", "unknown")
-            
-            logger.info(f"Chat started - Thread: {thread_id}, Agent: {agent_id}, Status: {status}")
-            return thread_id
-            
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 503:
-                logger.error("Backend service not properly configured")
-                return "ERROR: Backend service not configured. Check server logs."
-            else:
-                logger.error(f"HTTP error starting chat: {e}")
-                return f"ERROR: HTTP {e.response.status_code}"
-                
-        except requests.exceptions.ConnectionError:
-            logger.error("Cannot connect to backend")
-            return "ERROR: Cannot connect to backend"
-            
-        except requests.exceptions.Timeout:
-            logger.error("Backend timeout")
-            return "ERROR: Backend timeout"
-            
-        except Exception as e:
-            logger.error(f"Unexpected error starting chat: {e}")
-            return f"ERROR: {str(e)}"
-    
-    def send_message(self, thread_id: str, message: str, retry_count=0) -> Tuple[str, Optional[str]]:
-        """Envía un mensaje al backend con manejo mejorado de errores"""
-        try:
-            response = self.session.post(
-                f"{self.base_url}/chat",
-                json={"thread_id": thread_id, "message": message},
-                timeout=CHAT_TIMEOUT
-            )
-            response.raise_for_status()
-            data = response.json()
-            return data.get("reply", ""), data.get("image_url")
-            
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 500:
-                # Intentar parsear el mensaje de error del backend
-                try:
-                    error_detail = e.response.json().get("detail", str(e))
-                except:
-                    error_detail = str(e)
-                
-                # Si es un error de thread, sugerir reiniciar
-                if "thread" in error_detail.lower():
-                    return "❌ La sesión ha expirado. Por favor, haz clic en 'Nueva Conversación' para continuar.", None
-                elif "agent" in error_detail.lower() and retry_count < 2:
-                    # Reintentar si es un error de agente
-                    logger.warning(f"Agent error, retrying... (attempt {retry_count + 1})")
-                    time.sleep(2)
-                    return self.send_message(thread_id, message, retry_count + 1)
-                else:
-                    return f"❌ Error del servidor: {error_detail}", None
-            else:
-                return f"❌ Error HTTP {e.response.status_code}", None
-                
-        except requests.exceptions.Timeout:
-            return "⏱️ La solicitud tardó demasiado. El problema matemático puede ser complejo. Por favor, intenta de nuevo.", None
-            
-        except requests.exceptions.ConnectionError:
-            return "🔌 Error de conexión con el backend. Verifica que el servicio esté activo.", None
-            
-        except Exception as e:
-            logger.error(f"Unexpected error sending message: {e}")
-            return f"❌ Error inesperado: {str(e)}", None
-
-# Cliente global
-backend_client = BackendClient(BACKEND_URL)
-
-def format_message_with_image(text: str, image_url: Optional[str]) -> str:
-    """Formatea el mensaje incluyendo la imagen si existe"""
-    if image_url:
-        # Usar HTML para mejor control de la imagen
-        return f"""{text}
-
-<div style="margin-top: 10px;">
-    <a href="{image_url}" target="_blank">
-        <img src="{image_url}" style="max-width: 100%; height: auto; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); cursor: pointer;" title="Click para ver en tamaño completo" />
-    </a>
-</div>"""
-    return text
-
-def start_new_chat() -> str:
-    """Inicia una nueva conversación"""
-    return backend_client.start_chat()
-
-def process_message(
-    message: str, 
-    history: List[List[str]], 
-    thread_id: str
-) -> Tuple[str, List[List[str]], str]:
-    """Procesa un mensaje del usuario con mejor manejo de errores"""
-    
-    if not message.strip():
-        return "", history, thread_id
-    
-    # Agregar indicador de procesamiento inmediatamente
-    temp_history = history + [[message, "🤔 Procesando tu pregunta..."]]
-    
-    # Verificar o iniciar thread
-    if not thread_id or thread_id.startswith("ERROR"):
-        thread_id = start_new_chat()
-        if thread_id.startswith("ERROR"):
-            error_msg = f"""⚠️ {thread_id}
-
-**Posibles soluciones:**
-1. Verifica que el backend esté ejecutándose en {BACKEND_URL}
-2. Revisa las variables de entorno en el archivo .env
-3. Consulta los logs del backend para más detalles"""
-            return "", history + [[message, error_msg]], thread_id
-    
-    # Enviar mensaje
-    reply, image_url = backend_client.send_message(thread_id, message)
-    
-    # Formatear respuesta
-    formatted_reply = format_message_with_image(reply, image_url)
-    
-    # Actualizar historial con la respuesta real
-    final_history = history + [[message, formatted_reply]]
-    
-    return "", final_history, thread_id
-
-def clear_chat() -> Tuple[None, List, str]:
-    """Limpia el chat y reinicia la sesión"""
-    logger.info("Clearing chat and starting new session")
-    new_thread_id = start_new_chat()
-    return None, [], new_thread_id
-
-def get_status_html() -> str:
-    """Genera el HTML del estado del sistema con información detallada"""
-    # Forzar verificación de salud
-    backend_client.check_health(force=True)
-    
-    if backend_client.is_healthy:
-        health = backend_client.health_info
-        env_type = "Local" if health.get("is_local") else "Azure"
-        agent_status = "✅ Listo" if health.get("agent_ready") else "⚠️ No disponible"
-        storage_status = "✅ Conectado" if health.get("storage_ready") else "⚠️ Desconectado"
-        
-        # Obtener configuración
-        config = health.get("configuration", {})
-        config_items = []
-        for key, value in config.items():
-            status_icon = "✅" if value else "❌"
-            config_items.append(f"<li>{status_icon} {key.replace('_', ' ').title()}</li>")
-        
-        return f"""
-        <div style="padding: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; color: white;">
-            <h4 style="margin: 0 0 15px 0; font-size: 1.2em;">🚀 Estado del Sistema</h4>
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
-                <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 5px;">
-                    <strong>🌐 Backend:</strong> ✅ Conectado
-                </div>
-                <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 5px;">
-                    <strong>🔧 Entorno:</strong> {env_type}
-                </div>
-                <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 5px;">
-                    <strong>🤖 Agente IA:</strong> {agent_status}
-                </div>
-                <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 5px;">
-                    <strong>💾 Storage:</strong> {storage_status}
-                </div>
-            </div>
-            <details style="margin-top: 10px;">
-                <summary style="cursor: pointer;">📋 Configuración Detallada</summary>
-                <ul style="margin-top: 10px; padding-left: 20px;">
-                    {''.join(config_items)}
-                </ul>
-            </details>
-        </div>
-        """
+# --- CONFIGURACIÓN DE CREDENCIALES ---
+def get_credential():
+    """
+    Obtiene las credenciales apropiadas según el entorno.
+    En local usa InteractiveBrowserCredential o AzureCliCredential.
+    En Azure usa ManagedIdentityCredential.
+    """
+    if IS_LOCAL:
+        # Para desarrollo local, intentar primero Azure CLI, luego browser
+        credential = ChainedTokenCredential(
+            AzureCliCredential(),
+            InteractiveBrowserCredential()
+        )
+        logger.info("Using local development credentials (Azure CLI or Browser)")
     else:
-        # Intentar obtener información detallada de error
-        detailed = backend_client.check_detailed_health()
-        errors = detailed.get("errors", ["No se pudo conectar con el backend"])
-        
-        error_list = "".join([f"<li>❌ {error}</li>" for error in errors])
-        
-        return f"""
-        <div style="padding: 15px; background: linear-gradient(135deg, #f93b1d 0%, #ea1e63 100%); border-radius: 10px; color: white;">
-            <h4 style="margin: 0 0 15px 0; font-size: 1.2em;">⚠️ Sistema No Disponible</h4>
-            <div style="background: rgba(255,255,255,0.1); padding: 10px; border-radius: 5px; margin-bottom: 10px;">
-                <strong>Estado:</strong> Desconectado
-            </div>
-            <details>
-                <summary style="cursor: pointer;">🔍 Detalles del Error</summary>
-                <ul style="margin-top: 10px; padding-left: 20px;">
-                    {error_list}
-                </ul>
-                <div style="margin-top: 10px; padding: 10px; background: rgba(0,0,0,0.2); border-radius: 5px;">
-                    <strong>Solución sugerida:</strong><br>
-                    1. Verifica que el backend esté ejecutándose<br>
-                    2. Revisa la configuración en <code>{BACKEND_URL}</code><br>
-                    3. Consulta los logs del servidor
-                </div>
-            </details>
-        </div>
-        """
-
-def refresh_status() -> str:
-    """Actualiza el estado del sistema"""
-    return get_status_html()
-
-# CSS personalizado mejorado
-custom_css = """
-.gradio-container {
-    max-width: 1200px !important;
-    margin: auto !important;
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif !important;
-}
-#chatbot {
-    height: 600px !important;
-    border: 1px solid #e5e7eb !important;
-    border-radius: 8px !important;
-}
-.message img {
-    max-width: 100%;
-    height: auto;
-    border-radius: 8px;
-    margin-top: 10px;
-}
-.status-container {
-    margin-top: 20px;
-}
-/* Mejorar el aspecto de los botones */
-.gr-button {
-    transition: all 0.3s ease !important;
-}
-.gr-button:hover {
-    transform: translateY(-2px) !important;
-    box-shadow: 0 5px 15px rgba(0,0,0,0.1) !important;
-}
-/* Animación de carga */
-@keyframes pulse {
-    0% { opacity: 1; }
-    50% { opacity: 0.5; }
-    100% { opacity: 1; }
-}
-.loading {
-    animation: pulse 2s infinite;
-}
-"""
-
-# Interfaz de Gradio mejorada
-with gr.Blocks(theme=gr.themes.Soft(
-    primary_hue="indigo",
-    secondary_hue="purple"
-), css=custom_css) as demo:
-    gr.Markdown(
-        """
-        # 🎓 AI Math Tutor
-        ### Powered by Azure AI Foundry Agent Service
-        
-        <p style="color: #6b7280; font-size: 0.95em;">
-        Haz cualquier pregunta matemática o solicita visualizaciones. 
-        El tutor puede resolver problemas paso a paso, crear gráficos interactivos y explicar conceptos complejos.
-        </p>
-        """
-    )
-    
-    # Estado del thread
-    thread_id = gr.State("")
-    
-    # Chatbot principal con configuración mejorada
-    chatbot = gr.Chatbot(
-        label="Tutor de Matemáticas IA",
-        bubble_full_width=False,
-        height=500,
-        elem_id="chatbot",
-        show_copy_button=True,
-        render_markdown=True,
-        avatar_images=(None, "🤖")
-    )
-    
-    # Área de entrada mejorada
-    with gr.Row():
-        msg_box = gr.Textbox(
-            label="Tu pregunta:",
-            placeholder="Ejemplo: 'Dibuja la gráfica de y = sin(x)' o 'Explica la derivada paso a paso'",
-            lines=2,
-            scale=4,
-            autofocus=True
+        # En Azure, usar Managed Identity
+        credential = ChainedTokenCredential(
+            ManagedIdentityCredential(),
+            DefaultAzureCredential()
         )
-        with gr.Column(scale=1):
-            submit_btn = gr.Button(
-                "🚀 Enviar", 
-                variant="primary", 
-                size="lg"
+        logger.info("Using Azure Managed Identity credentials")
+    
+    return credential
+
+# Inicializar credenciales
+credential = get_credential()
+
+# --- CLIENTES DE AZURE ---
+try:
+    # AI Project Client
+    project_client = AIProjectClient(
+        endpoint=project_endpoint, 
+        credential=credential
+    )
+    logger.info("AI Project Client initialized successfully")
+    
+    # Blob Storage Client
+    blob_service_client = BlobServiceClient(
+        account_url=f"https://{storage_account_name}.blob.core.windows.net",
+        credential=credential
+    )
+    logger.info("Blob Storage Client initialized successfully")
+    
+    # Verificar/crear contenedor de imágenes
+    container_client = blob_service_client.get_container_client(images_container_name)
+    try:
+        container_client.get_container_properties()
+        logger.info(f"Container '{images_container_name}' exists")
+    except ResourceNotFoundError:
+        container_client.create_container(public_access="blob")
+        logger.info(f"Container '{images_container_name}' created")
+        
+except Exception as e:
+    logger.error(f"Error initializing Azure clients: {e}")
+    # No hacer raise aquí para permitir que el servicio arranque
+    # y devuelva errores apropiados en los endpoints
+
+# --- GESTIÓN DE AGENTES ---
+class AgentManager:
+    """Gestiona la creación y reutilización de agentes"""
+    
+    def __init__(self, project_client: AIProjectClient):
+        self.project_client = project_client
+        self.agent_id: Optional[str] = None
+        self._last_check_time = 0
+        self._check_interval = 300  # Verificar cada 5 minutos
+    
+    @retry(max_attempts=3, delay=2, exceptions=(AzureError, Exception))
+    def get_or_create_agent(self) -> str:
+        """Obtiene un agente existente o crea uno nuevo con retry logic"""
+        # Si ya tenemos un agent_id y no ha pasado mucho tiempo, usarlo
+        current_time = time.time()
+        if self.agent_id and (current_time - self._last_check_time) < self._check_interval:
+            return self.agent_id
+        
+        try:
+            with self.project_client:
+                # Intentar obtener un agente existente
+                agents = self.project_client.agents.list()
+                for agent in agents:
+                    if agent.name == AGENT_NAME:
+                        self.agent_id = agent.id
+                        self._last_check_time = current_time
+                        logger.info(f"Using existing agent: {self.agent_id}")
+                        return self.agent_id
+                
+                # Si no existe, crear uno nuevo
+                logger.info("Creating new agent...")
+                code_interpreter = CodeInterpreterTool()
+                agent = self.project_client.agents.create_agent(
+                    model=model_deployment_name,
+                    name=AGENT_NAME,
+                    instructions="""You are a friendly and expert math tutor. 
+                    Use the Code Interpreter tool to:
+                    - Solve mathematical problems step by step
+                    - Create visualizations and graphs when helpful
+                    - Explain complex concepts clearly
+                    Always show your work and explain your reasoning.
+                    Respond in the same language as the user's question.""",
+                    tools=code_interpreter.definitions,
+                    temperature=0.7,
+                    top_p=0.95
+                )
+                self.agent_id = agent.id
+                self._last_check_time = current_time
+                logger.info(f"Created new agent: {self.agent_id}")
+                return self.agent_id
+                
+        except Exception as e:
+            logger.error(f"Error managing agent: {e}")
+            self.agent_id = None  # Reset para intentar de nuevo
+            raise
+    
+    def reset_agent(self):
+        """Resetea el agent_id para forzar una nueva búsqueda/creación"""
+        self.agent_id = None
+        self._last_check_time = 0
+        logger.info("Agent manager reset")
+
+# Inicializar el manager solo si tenemos configuración válida
+agent_manager = None
+if project_endpoint and storage_account_name:
+    try:
+        agent_manager = AgentManager(project_client)
+    except Exception as e:
+        logger.error(f"Could not initialize AgentManager: {e}")
+
+# --- MODELOS DE DATOS ---
+class ChatRequest(BaseModel):
+    thread_id: str
+    message: str
+
+class ChatResponse(BaseModel):
+    reply: str
+    image_url: Optional[str] = None
+
+class HealthResponse(BaseModel):
+    status: str
+    is_local: bool
+    agent_ready: bool
+    storage_ready: bool
+    configuration: Dict[str, bool]
+
+class DetailedHealthResponse(BaseModel):
+    status: str
+    is_local: bool
+    checks: Dict[str, Any]
+    configuration: Dict[str, str]
+    errors: list
+
+# --- ENDPOINTS ---
+@app.get("/", tags=["General"])
+async def root():
+    """Endpoint raíz con información del servicio"""
+    return {
+        "service": "Math Tutor Backend",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "health_detailed": "/health/detailed",
+            "docs": "/docs",
+            "start_chat": "/start_chat",
+            "chat": "/chat"
+        }
+    }
+
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+async def health_check():
+    """Verifica el estado básico del servicio"""
+    try:
+        agent_ready = False
+        storage_ready = False
+        
+        # Verificar agente
+        if agent_manager:
+            try:
+                agent_id = agent_manager.get_or_create_agent()
+                agent_ready = bool(agent_id)
+            except Exception as e:
+                logger.warning(f"Agent check failed: {e}")
+        
+        # Verificar storage
+        try:
+            container_client.get_container_properties()
+            storage_ready = True
+        except Exception as e:
+            logger.warning(f"Storage check failed: {e}")
+        
+        # Configuración
+        configuration = {
+            "project_endpoint_set": bool(project_endpoint),
+            "storage_account_set": bool(storage_account_name),
+            "model_deployment_set": bool(model_deployment_name),
+            "container_name_set": bool(images_container_name)
+        }
+        
+        # Determinar estado general
+        all_ready = agent_ready and storage_ready and all(configuration.values())
+        
+        return HealthResponse(
+            status="healthy" if all_ready else "degraded",
+            is_local=IS_LOCAL,
+            agent_ready=agent_ready,
+            storage_ready=storage_ready,
+            configuration=configuration
+        )
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return HealthResponse(
+            status="unhealthy",
+            is_local=IS_LOCAL,
+            agent_ready=False,
+            storage_ready=False,
+            configuration={}
+        )
+
+@app.get("/health/detailed", response_model=DetailedHealthResponse, tags=["Health"])
+async def detailed_health_check():
+    """Verifica el estado detallado del servicio con todos los componentes"""
+    errors = []
+    checks = {}
+    
+    # Verificar configuración
+    configuration = {
+        "project_endpoint": project_endpoint or "NOT_SET",
+        "storage_account": storage_account_name or "NOT_SET",
+        "model_deployment": model_deployment_name or "NOT_SET",
+        "container_name": images_container_name or "NOT_SET",
+        "environment": "LOCAL" if IS_LOCAL else "AZURE"
+    }
+    
+    # Verificar Project Client
+    checks["project_client"] = False
+    if project_client and project_endpoint:
+        try:
+            with project_client:
+                # Intentar una operación simple
+                _ = list(project_client.agents.list())
+                checks["project_client"] = True
+        except Exception as e:
+            errors.append(f"Project client error: {str(e)}")
+    else:
+        errors.append("Project client not configured")
+    
+    # Verificar Storage
+    checks["storage_account"] = False
+    checks["storage_container"] = False
+    if blob_service_client and storage_account_name:
+        try:
+            # Verificar cuenta
+            _ = blob_service_client.get_account_information()
+            checks["storage_account"] = True
+            
+            # Verificar contenedor
+            container_client.get_container_properties()
+            checks["storage_container"] = True
+        except Exception as e:
+            errors.append(f"Storage error: {str(e)}")
+    else:
+        errors.append("Storage not configured")
+    
+    # Verificar Agent
+    checks["agent_available"] = False
+    checks["agent_id"] = None
+    if agent_manager:
+        try:
+            agent_id = agent_manager.get_or_create_agent()
+            checks["agent_available"] = True
+            checks["agent_id"] = agent_id
+        except Exception as e:
+            errors.append(f"Agent error: {str(e)}")
+    else:
+        errors.append("Agent manager not initialized")
+    
+    # Determinar estado general
+    all_checks_pass = all(
+        v for k, v in checks.items() 
+        if k != "agent_id" and isinstance(v, bool)
+    )
+    
+    return DetailedHealthResponse(
+        status="healthy" if all_checks_pass else "degraded" if any(checks.values()) else "unhealthy",
+        is_local=IS_LOCAL,
+        checks=checks,
+        configuration=configuration,
+        errors=errors
+    )
+
+@app.post("/start_chat", response_model=dict, tags=["Chat"])
+async def start_chat():
+    """Inicia una nueva sesión de chat"""
+    if not agent_manager:
+        raise HTTPException(
+            status_code=503,
+            detail="Service not properly configured. Check environment variables."
+        )
+    
+    try:
+        # Asegurar que el agente existe
+        agent_id = agent_manager.get_or_create_agent()
+        
+        # Crear un nuevo thread
+        with project_client:
+            thread = project_client.agents.threads.create()
+            logger.info(f"Created new thread: {thread.id}")
+            return {
+                "thread_id": thread.id,
+                "agent_id": agent_id,
+                "status": "ready"
+            }
+            
+    except Exception as e:
+        logger.error(f"Error in start_chat: {e}", exc_info=True)
+        
+        # Si el error es relacionado con el agente, intentar reset
+        if "agent" in str(e).lower():
+            agent_manager.reset_agent()
+            
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start chat: {str(e)}"
+        )
+
+@app.post("/chat", response_model=ChatResponse, tags=["Chat"])
+async def chat(request: ChatRequest):
+    """Procesa un mensaje del chat"""
+    if not agent_manager:
+        raise HTTPException(
+            status_code=503,
+            detail="Service not properly configured. Check environment variables."
+        )
+    
+    try:
+        agent_id = agent_manager.get_or_create_agent()
+        
+        with project_client:
+            # Agregar mensaje del usuario
+            logger.info(f"Processing message for thread {request.thread_id}: {request.message[:50]}...")
+            
+            project_client.agents.messages.create(
+                thread_id=request.thread_id,
+                role="user",
+                content=request.message,
             )
-            clear_btn = gr.Button(
-                "🔄 Nueva Conversación", 
-                variant="secondary"
+
+            # Crear y procesar el run con timeout
+            logger.info("Creating and processing run...")
+            run = project_client.agents.runs.create_and_process(
+                thread_id=request.thread_id,
+                agent_id=agent_id,
+                timeout=60  # Timeout de 60 segundos
             )
-    
-    # Ejemplos organizados por categoría
-    with gr.Accordion("📚 Ejemplos de Preguntas", open=False):
-        gr.Examples(
-            examples=[
-                # Visualizaciones
-                "Dibuja la gráfica de y = x^2 - 4x + 3",
-                "Grafica la función f(x) = e^(-x) * cos(2πx)",
-                "Visualiza la distribución normal con media 0 y desviación estándar 1",
-                # Cálculo
-                "Explica la derivada de sin(x) paso a paso",
-                "Muestra cómo calcular la integral de x^2 dx",
-                "¿Qué es una integral definida? Muéstrame un ejemplo visual",
-                # Álgebra
-                "Resuelve la ecuación: 2x^2 + 5x - 3 = 0",
-                "Factoriza x^3 - 8",
-                # Geometría
-                "Explica el teorema de Pitágoras con un ejemplo visual",
-                "Calcula el área de un círculo de radio 5",
-                # Estadística
-                "¿Qué es la desviación estándar?",
-                "Explica la distribución binomial con un ejemplo"
-            ],
-            inputs=msg_box,
-            label="Haz clic en un ejemplo para usarlo"
+
+            if run.status == "failed":
+                error_msg = f"Agent run failed: {run.last_error}"
+                logger.error(error_msg)
+                
+                # Si falla, intentar resetear el agente para el próximo intento
+                if "not found" in str(run.last_error).lower():
+                    agent_manager.reset_agent()
+                
+                raise HTTPException(status_code=500, detail=error_msg)
+
+            # Obtener mensajes
+            messages = project_client.agents.messages.list(thread_id=request.thread_id)
+            
+            reply = ""
+            image_url = None
+
+            # Buscar la respuesta más reciente del asistente
+            for message in messages:
+                if message.role == "assistant":
+                    # Procesar contenido de texto
+                    if hasattr(message, 'content') and message.content:
+                        if isinstance(message.content, str):
+                            reply = message.content
+                        elif isinstance(message.content, list):
+                            # El contenido puede ser una lista de objetos
+                            for content in message.content:
+                                if hasattr(content, 'text'):
+                                    if hasattr(content.text, 'value'):
+                                        reply += content.text.value
+                                    else:
+                                        reply += str(content.text)
+                    
+                    # Procesar imágenes si existen
+                    if hasattr(message, 'image_contents') and message.image_contents:
+                        try:
+                            img = message.image_contents[0]
+                            file_id = img.image_file.file_id if hasattr(img, 'image_file') else img.file_id
+                            
+                            logger.info(f"Downloading image file: {file_id}")
+                            file_content = project_client.agents.files.download(file_id=file_id)
+                            
+                            # El contenido puede venir en diferentes formatos
+                            if isinstance(file_content, dict):
+                                image_bytes = file_content.get('content', file_content)
+                            else:
+                                image_bytes = file_content
+                            
+                            # Subir a blob storage con retry
+                            @retry(max_attempts=3, delay=1)
+                            def upload_image():
+                                blob_name = f"{file_id}.png"
+                                blob_client = blob_service_client.get_blob_client(
+                                    container=images_container_name, 
+                                    blob=blob_name
+                                )
+                                
+                                logger.info(f"Uploading image to blob: {blob_name}")
+                                if isinstance(image_bytes, bytes):
+                                    blob_client.upload_blob(image_bytes, overwrite=True)
+                                else:
+                                    with io.BytesIO(image_bytes) as stream:
+                                        blob_client.upload_blob(stream, overwrite=True)
+                                
+                                return blob_client.url
+                            
+                            image_url = upload_image()
+                            logger.info(f"Image uploaded successfully: {image_url}")
+                            
+                        except Exception as img_error:
+                            logger.error(f"Error processing image: {img_error}", exc_info=True)
+                            # No fallar toda la respuesta por un error de imagen
+                    
+                    break  # Solo necesitamos el mensaje más reciente
+            
+            if not reply:
+                reply = "Lo siento, no pude generar una respuesta. Por favor, intenta de nuevo."
+            
+            logger.info("Chat response prepared successfully")
+            return ChatResponse(reply=reply, image_url=image_url)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in chat: {e}", exc_info=True)
+        
+        # Intentar proporcionar un mensaje de error más útil
+        error_detail = str(e)
+        if "thread" in error_detail.lower():
+            error_detail = "Invalid or expired thread. Please start a new chat."
+        elif "agent" in error_detail.lower():
+            error_detail = "Agent service temporarily unavailable. Please try again."
+            agent_manager.reset_agent()
+        
+        raise HTTPException(status_code=500, detail=error_detail)
+
+@app.delete("/cleanup_agent", tags=["Admin"])
+async def cleanup_agent():
+    """Limpia el agente (útil para desarrollo y debugging)"""
+    try:
+        if not IS_LOCAL:
+            raise HTTPException(
+                status_code=403,
+                detail="Cleanup only available in local mode for security"
+            )
+        
+        if not agent_manager:
+            raise HTTPException(
+                status_code=503,
+                detail="Agent manager not initialized"
+            )
+        
+        with project_client:
+            if agent_manager.agent_id:
+                try:
+                    project_client.agents.delete(agent_id=agent_manager.agent_id)
+                    old_id = agent_manager.agent_id
+                    agent_manager.reset_agent()
+                    logger.info(f"Deleted agent: {old_id}")
+                    return {"message": f"Agent {old_id} deleted successfully", "status": "deleted"}
+                except Exception as e:
+                    logger.warning(f"Could not delete agent: {e}")
+                    agent_manager.reset_agent()
+                    return {"message": "Agent reset but could not delete", "status": "reset"}
+            else:
+                return {"message": "No agent to delete", "status": "no_action"}
+                
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cleaning up agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/reset_agent", tags=["Admin"])
+async def reset_agent():
+    """Resetea el agent manager para forzar nueva búsqueda/creación"""
+    if not agent_manager:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent manager not initialized"
         )
     
-    # Estado del sistema con auto-actualización
-    with gr.Accordion("🔧 Estado del Sistema", open=False):
-        status_html = gr.HTML(value=get_status_html())
-        with gr.Row():
-            refresh_btn = gr.Button("🔄 Actualizar Estado", size="sm")
-            auto_refresh = gr.Checkbox(label="Auto-actualizar cada 30s", value=False)
+    agent_manager.reset_agent()
+    return {"message": "Agent manager reset successfully", "status": "reset"}
+
+# --- EVENTO DE INICIO ---
+@app.on_event("startup")
+async def startup_event():
+    """Inicialización al arrancar el servicio"""
+    logger.info("="*60)
+    logger.info("Math Tutor Backend Starting...")
+    logger.info(f"Environment: {'LOCAL' if IS_LOCAL else 'AZURE'}")
+    logger.info(f"Project Endpoint: {project_endpoint}")
+    logger.info(f"Model: {model_deployment_name}")
+    logger.info(f"Storage Account: {storage_account_name}")
+    logger.info("="*60)
     
-    # Información adicional mejorada
-    with gr.Accordion("ℹ️ Guía de Uso", open=False):
-        gr.Markdown(
-            """
-            ### 🎯 Capacidades del Tutor
-            
-            **Matemáticas que puede resolver:**
-            - ✅ **Álgebra**: Ecuaciones, factorización, sistemas de ecuaciones
-            - ✅ **Cálculo**: Derivadas, integrales, límites, series
-            - ✅ **Geometría**: Áreas, volúmenes, teoremas
-            - ✅ **Trigonometría**: Funciones, identidades, gráficas
-            - ✅ **Estadística**: Distribuciones, probabilidad, análisis de datos
-            - ✅ **Álgebra Lineal**: Matrices, vectores, transformaciones
-            
-            ### 💡 Tips para mejores resultados:
-            1. **Sé específico**: "Resuelve x^2 + 2x - 3 = 0" en lugar de "resuelve esta ecuación"
-            2. **Pide visualizaciones**: "Dibuja la gráfica de..." para ver representaciones visuales
-            3. **Solicita explicaciones paso a paso**: "Explica paso a paso cómo..."
-            4. **Usa notación matemática estándar**: x^2 para x², sqrt(x) para √x
-            
-            ### ⚡ Atajos de teclado:
-            - **Enter**: Enviar mensaje
-            - **Shift+Enter**: Nueva línea
-            - **Ctrl+K**: Limpiar chat
-            """
-        )
-    
-    # Timer para auto-actualización (simulado con JavaScript)
-    auto_refresh_timer = gr.Timer(30, active=False)
-    
-    # Configurar eventos
-    msg_box.submit(
-        process_message,
-        [msg_box, chatbot, thread_id],
-        [msg_box, chatbot, thread_id]
-    )
-    
-    submit_btn.click(
-        process_message,
-        [msg_box, chatbot, thread_id],
-        [msg_box, chatbot, thread_id]
-    )
-    
-    clear_btn.click(
-        clear_chat,
-        [],
-        [msg_box, chatbot, thread_id]
-    )
-    
-    refresh_btn.click(
-        refresh_status,
-        [],
-        [status_html]
-    )
-    
-    # Auto-refresh cuando está activado
-    def toggle_auto_refresh(checked):
-        return gr.Timer(active=checked)
-    
-    auto_refresh.change(
-        toggle_auto_refresh,
-        [auto_refresh],
-        [auto_refresh_timer]
-    )
-    
-    auto_refresh_timer.tick(
-        refresh_status,
-        [],
-        [status_html]
-    )
-    
-    # Inicializar al cargar
-    demo.load(
-        start_new_chat,
-        [],
-        [thread_id]
-    )
+    # Pre-crear el agente para verificar que todo funciona
+    if agent_manager:
+        try:
+            agent_id = agent_manager.get_or_create_agent()
+            logger.info(f"✅ Agent ready: {agent_id}")
+        except Exception as e:
+            logger.error(f"⚠️ Warning: Could not pre-create agent: {e}")
+            logger.info("Agent will be created on first request")
+    else:
+        logger.warning("⚠️ Agent manager not initialized - check configuration")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Limpieza al cerrar el servicio"""
+    logger.info("Math Tutor Backend shutting down...")
+    # Aquí podrías agregar limpieza adicional si es necesaria
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
-    
-    logger.info("="*60)
-    logger.info("Starting Math Tutor Frontend")
-    logger.info(f"Port: {port}")
-    logger.info(f"Backend URL: {BACKEND_URL}")
-    logger.info("="*60)
-    
-    # Verificar conexión inicial con el backend
-    initial_health = backend_client.check_health(force=True)
-    if initial_health:
-        logger.info("✅ Backend connection successful")
-        logger.info(f"Backend status: {backend_client.health_info}")
-    else:
-        logger.warning("⚠️ Cannot connect to backend - frontend will start anyway")
-        logger.info("Users will see connection errors until backend is available")
-    
-    # Lanzar la aplicación
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=port,
-        share=False,
-        show_error=True,  # Mostrar errores en la UI
-        quiet=False  # Mostrar logs
+    import uvicorn
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000, 
+        reload=IS_LOCAL,  # Hot reload solo en desarrollo local
+        log_level="info"
     )
     
