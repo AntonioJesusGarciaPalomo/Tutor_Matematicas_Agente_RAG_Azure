@@ -211,71 +211,45 @@ class LocalDevSetup:
         
         return all_ok
     
-    def check_env_file(self) -> bool:
-        """Verifica y configura el archivo .env"""
+    def check_env_file(self) -> bool:    
+        """Verifica el archivo .env sin modificarlo"""
         print_header("5. Verificando Configuración (.env)")
         
         if not self.env_file.exists():
-            if (self.root_dir / ".env.template").exists():
-                print_step(".env no existe, copiando desde template...", "WARNING")
-                import shutil
-                shutil.copy(self.root_dir / ".env.template", self.env_file)
-                print_step(".env creado desde template", "OK")
-            else:
-                print_step(".env y .env.template no existen", "ERROR")
-                self.errors.append(".env file missing")
-                return False
+            print_step(".env NO existe", "ERROR")
+            print_step("Por favor, crea un .env basado en .env.template", "ERROR")
+            self.errors.append(".env file missing")
+            return False
         
-        # Leer y verificar variables
+        # Solo leer y verificar, sin modificar
         env_vars = {}
         with open(self.env_file, 'r') as f:
             for line in f:
                 line = line.strip()
-                if line and not line.startswith('#'):
-                    if '=' in line:
-                        key, value = line.split('=', 1)
-                        env_vars[key] = value
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    env_vars[key] = value
         
-        required_vars = [
-            "PROJECT_ENDPOINT",
-            "STORAGE_ACCOUNT_NAME",
-            "MODEL_DEPLOYMENT_NAME"
-        ]
-        
+        # Verificar variables requeridas
+        required_vars = ["PROJECT_ENDPOINT", "STORAGE_ACCOUNT_NAME", "MODEL_DEPLOYMENT_NAME"]
         missing_vars = []
+        
         for var in required_vars:
             if var not in env_vars or not env_vars[var]:
                 missing_vars.append(var)
                 print_step(f"{var}: NO CONFIGURADO", "ERROR")
             else:
-                value_preview = env_vars[var][:30] + "..." if len(env_vars[var]) > 30 else env_vars[var]
+                # Mostrar solo primeros caracteres por seguridad
+                value_preview = env_vars[var][:20] + "..." if len(env_vars[var]) > 20 else "***"
                 print_step(f"{var}: {value_preview}", "OK")
         
         if missing_vars:
-            self.errors.append(f"Variables faltantes en .env: {', '.join(missing_vars)}")
-            print(f"\n  {Colors.YELLOW}Por favor, edita el archivo .env y configura:{Colors.NC}")
-            for var in missing_vars:
-                print(f"    - {var}")
+            self.errors.append(f"Variables faltantes: {', '.join(missing_vars)}")
             return False
         
-        # Copiar .env a subdirectorios
-        for target_dir in [self.backend_dir, self.frontend_dir]:
-            target_env = target_dir / ".env"
-            import shutil
-            shutil.copy(self.env_file, target_env)
-        print_step(".env copiado a backend/ y frontend/", "OK")
-        
-        # Agregar variables adicionales para desarrollo local
-        env_vars["ENVIRONMENT"] = "local"
-        env_vars["DEBUG"] = "true"
-        
-        # Guardar variables actualizadas
-        with open(self.backend_dir / ".env", 'a') as f:
-            f.write("\n# Variables para desarrollo local\n")
-            f.write("ENVIRONMENT=local\n")
-            f.write("DEBUG=true\n")
-        
+        print_step(".env verificado correctamente", "OK")
         return True
+        
     
     def test_backend(self) -> bool:
         """Prueba que el backend funciona correctamente"""

@@ -1,4 +1,11 @@
+# Variables de entorno con datos reales
 .env
+.env.local
+.env.production
+
+# Archivos .env en subdirectorios
+backend/.env
+frontend/.env
 
 # Azure Developer CLI
 .azure/
@@ -7,16 +14,16 @@
 __pycache__/
 *.pyc
 .venv/
+*.egg-info/
 
 # VS Code
 .vscode/
-
-# Archivos de entorno locales
-backend/.env
-frontend/.env
+# PyCharm
+.idea/
 
 # Logs
 *.log
+backend.log
 
 # Tests
 .pytest_cache/
@@ -24,3 +31,9 @@ htmlcov/
 
 # Docker volumes
 .docker/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
