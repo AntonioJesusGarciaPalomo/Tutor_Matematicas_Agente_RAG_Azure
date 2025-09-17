@@ -2,167 +2,204 @@ import gradio as gr
 import requests
 import os
 import logging
+import asyncio
 from typing import List, Tuple, Optional
+from datetime import datetime
 
-# Configuración de logging
-logging.basicConfig(level=logging.INFO)
+# Configuración de logging mejorada
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Obtener la URL del backend con validación
-BACKEND_URL = os.environ.get("BACKEND_URI")
-
-# Validación crítica
-if not BACKEND_URL:
-    logger.error("BACKEND_URI environment variable is not set!")
-    # Intentar usar un valor por defecto o mostrar error
-    BACKEND_URL = "http://localhost:8000"
-    logger.warning(f"Using default BACKEND_URL: {BACKEND_URL}")
-
-# Asegurar que la URL no tenga trailing slash
+# Configuración del backend
+BACKEND_URL = os.environ.get("BACKEND_URI", "http://localhost:8000")
 BACKEND_URL = BACKEND_URL.rstrip('/')
-logger.info(f"Backend URL configured: {BACKEND_URL}")
+
+# Timeouts configurables
+STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "30"))
+CHAT_TIMEOUT = int(os.environ.get("CHAT_TIMEOUT", "60"))
+
+logger.info(f"Backend URL: {BACKEND_URL}")
+logger.info(f"Startup timeout: {STARTUP_TIMEOUT}s, Chat timeout: {CHAT_TIMEOUT}s")
+
+class BackendClient:
+    """Cliente para comunicarse con el backend"""
+    
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.is_healthy = False
+        self.health_info = {}
+    
+    def check_health(self) -> bool:
+        """Verifica el estado del backend"""
+        try:
+            response = self.session.get(
+                f"{self.base_url}/health",
+                timeout=5
+            )
+            if response.status_code == 200:
+                self.health_info = response.json()
+                self.is_healthy = True
+                logger.info(f"Backend health: {self.health_info}")
+                return True
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            self.is_healthy = False
+        return False
+    
+    def start_chat(self) -> str:
+        """Inicia una nueva sesión de chat"""
+        try:
+            response = self.session.post(
+                f"{self.base_url}/start_chat",
+                timeout=STARTUP_TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
+            thread_id = data.get("thread_id")
+            agent_id = data.get("agent_id")
+            logger.info(f"Chat started - Thread: {thread_id}, Agent: {agent_id}")
+            return thread_id
+        except requests.exceptions.ConnectionError:
+            logger.error("Cannot connect to backend")
+            return "ERROR: Cannot connect to backend"
+        except requests.exceptions.Timeout:
+            logger.error("Backend timeout")
+            return "ERROR: Backend timeout"
+        except Exception as e:
+            logger.error(f"Error starting chat: {e}")
+            return f"ERROR: {str(e)}"
+    
+    def send_message(self, thread_id: str, message: str) -> Tuple[str, Optional[str]]:
+        """Envía un mensaje al backend"""
+        try:
+            response = self.session.post(
+                f"{self.base_url}/chat",
+                json={"thread_id": thread_id, "message": message},
+                timeout=CHAT_TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("reply", ""), data.get("image_url")
+        except requests.exceptions.Timeout:
+            return "⏱️ La solicitud tardó demasiado. El problema matemático puede ser complejo. Por favor, intenta de nuevo.", None
+        except requests.exceptions.ConnectionError:
+            return "🔌 Error de conexión con el backend. Verifica que el servicio esté activo.", None
+        except Exception as e:
+            logger.error(f"Error sending message: {e}")
+            return f"❌ Error: {str(e)}", None
+
+# Cliente global
+backend_client = BackendClient(BACKEND_URL)
+
+def format_message_with_image(text: str, image_url: Optional[str]) -> str:
+    """Formatea el mensaje incluyendo la imagen si existe"""
+    if image_url:
+        # Usar HTML para mejor control de la imagen
+        return f"""{text}
+
+<div style="margin-top: 10px;">
+    <img src="{image_url}" style="max-width: 100%; height: auto; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);" />
+</div>"""
+    return text
 
 def start_new_chat() -> str:
-    """Inicia una nueva conversación con el backend."""
-    try:
-        logger.info("Starting new chat session...")
-        response = requests.post(
-            f"{BACKEND_URL}/start_chat",
-            timeout=30  # Añadir timeout
-        )
-        response.raise_for_status()
-        thread_id = response.json()["thread_id"]
-        logger.info(f"New chat started with thread_id: {thread_id}")
-        return thread_id
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"Connection error to backend: {e}")
-        return f"Error: Cannot connect to backend at {BACKEND_URL}"
-    except requests.exceptions.Timeout as e:
-        logger.error(f"Timeout connecting to backend: {e}")
-        return "Error: Backend service timeout"
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error starting new chat: {e}")
-        return f"Error starting new chat: {str(e)}"
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        return f"Unexpected error: {str(e)}"
+    """Inicia una nueva conversación"""
+    return backend_client.start_chat()
 
-def chat_interface(
+def process_message(
     message: str, 
     history: List[List[str]], 
-    thread_id_state: str
+    thread_id: str
 ) -> Tuple[str, List[List[str]], str]:
-    """
-    Maneja la interfaz de chat con el backend.
+    """Procesa un mensaje del usuario"""
     
-    Args:
-        message: El mensaje del usuario
-        history: El historial de conversación
-        thread_id_state: El ID del thread actual
-    
-    Returns:
-        Tuple con (mensaje_vacío, historial_actualizado, thread_id)
-    """
-    
-    # Inicializar thread si no existe
-    if not thread_id_state or "Error" in str(thread_id_state):
-        thread_id_state = start_new_chat()
-        if "Error" in thread_id_state:
-            error_msg = f"⚠️ {thread_id_state}\n\nPlease check if the backend service is running."
-            return "", history + [[message, error_msg]], thread_id_state
-
-    try:
-        logger.info(f"Sending message to thread {thread_id_state}: {message[:50]}...")
-        
-        response = requests.post(
-            f"{BACKEND_URL}/chat",
-            json={"thread_id": thread_id_state, "message": message},
-            timeout=60  # Timeout más largo para procesamiento de IA
-        )
-        response.raise_for_status()
-        chat_response = response.json()
-        
-        # Procesar la respuesta
-        reply_text = chat_response.get("reply", "No response received")
-        image_url = chat_response.get("image_url")
-
-        if image_url:
-            # Si hay una imagen, incluirla en formato Markdown
-            final_reply = f"{reply_text}\n\n![Generated Image]({image_url})"
-            logger.info("Response includes an image")
-        else:
-            final_reply = reply_text
-            
-        # Actualizar el historial
-        new_history = history + [[message, final_reply]]
-        logger.info("Chat response received successfully")
-
-        return "", new_history, thread_id_state
-    
-    except requests.exceptions.Timeout:
-        error_message = "⏱️ Request timeout - the math problem might be complex. Please try again."
-        logger.error("Request timeout")
-        return "", history + [[message, error_message]], thread_id_state
-    
-    except requests.exceptions.ConnectionError:
-        error_message = f"🔌 Connection error: Cannot reach backend at {BACKEND_URL}"
-        logger.error("Connection error")
-        return "", history + [[message, error_message]], thread_id_state
-    
-    except requests.exceptions.RequestException as e:
-        error_message = f"❌ Error in chat: {str(e)}"
-        logger.error(f"Request error: {e}")
-        return "", history + [[message, error_message]], thread_id_state
-    
-    except Exception as e:
-        error_message = f"⚠️ Unexpected error: {str(e)}"
-        logger.error(f"Unexpected error: {e}")
-        return "", history + [[message, error_message]], thread_id_state
-
-def handle_submit(
-    message: str, 
-    history: List[List[str]], 
-    thread_id_state: str
-) -> Tuple[str, List[List[str]], str]:
-    """
-    Maneja el envío de mensajes, mostrando el mensaje del usuario inmediatamente.
-    """
     if not message.strip():
-        return "", history, thread_id_state
+        return "", history, thread_id
     
-    # Añadir el mensaje del usuario inmediatamente con indicador de carga
-    history_with_user = history + [[message, "🤔 Thinking..."]]
+    # Verificar o iniciar thread
+    if not thread_id or thread_id.startswith("ERROR"):
+        thread_id = start_new_chat()
+        if thread_id.startswith("ERROR"):
+            error_msg = f"⚠️ {thread_id}\n\nPor favor, verifica que el backend esté ejecutándose."
+            return "", history + [[message, error_msg]], thread_id
     
-    # Procesar la respuesta
-    _, new_history, new_thread_id = chat_interface(message, history, thread_id_state)
+    # Enviar mensaje
+    reply, image_url = backend_client.send_message(thread_id, message)
     
-    return "", new_history, new_thread_id
+    # Formatear respuesta
+    formatted_reply = format_message_with_image(reply, image_url)
+    
+    return "", history + [[message, formatted_reply]], thread_id
 
 def clear_chat() -> Tuple[None, List, str]:
-    """Limpia el chat y reinicia la sesión."""
+    """Limpia el chat y reinicia la sesión"""
     logger.info("Clearing chat and starting new session")
     new_thread_id = start_new_chat()
     return None, [], new_thread_id
 
-# Interfaz de Gradio mejorada
-with gr.Blocks(
-    theme=gr.themes.Soft(),
-    css="""
-    .gradio-container {
-        max-width: 900px !important;
-        margin: auto !important;
-    }
-    #chatbot {
-        height: 600px !important;
-    }
-    """
-) as demo:
+def get_status_html() -> str:
+    """Genera el HTML del estado del sistema"""
+    backend_client.check_health()
+    
+    if backend_client.is_healthy:
+        health = backend_client.health_info
+        env_type = "Local" if health.get("is_local") else "Azure"
+        agent_status = "✅" if health.get("agent_ready") else "⚠️"
+        storage_status = "✅" if health.get("storage_ready") else "⚠️"
+        
+        return f"""
+        <div style="padding: 10px; background: #f0f9ff; border-radius: 8px; margin-top: 10px;">
+            <h4 style="margin: 0 0 10px 0;">Estado del Sistema</h4>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px;">
+                <div>🌐 Backend: <strong>✅ Conectado</strong></div>
+                <div>🔧 Entorno: <strong>{env_type}</strong></div>
+                <div>🤖 Agente IA: <strong>{agent_status}</strong></div>
+                <div>💾 Storage: <strong>{storage_status}</strong></div>
+            </div>
+        </div>
+        """
+    else:
+        return """
+        <div style="padding: 10px; background: #fee; border-radius: 8px; margin-top: 10px;">
+            <h4 style="margin: 0 0 10px 0;">Estado del Sistema</h4>
+            <div>🌐 Backend: <strong>❌ Desconectado</strong></div>
+            <p style="margin: 10px 0 0 0; font-size: 0.9em;">
+                Verifica que el backend esté ejecutándose en <code>{BACKEND_URL}</code>
+            </p>
+        </div>
+        """.format(BACKEND_URL=BACKEND_URL)
+
+# CSS personalizado
+custom_css = """
+.gradio-container {
+    max-width: 1000px !important;
+    margin: auto !important;
+}
+#chatbot {
+    height: 600px !important;
+}
+.message img {
+    max-width: 100%;
+    height: auto;
+}
+.status-container {
+    margin-top: 20px;
+}
+"""
+
+# Interfaz de Gradio
+with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
     gr.Markdown(
         """
         # 🎓 AI Math Tutor
         ### Powered by Azure AI Foundry Agent Service
         
-        Ask any math question or request visualizations like graphs and charts!
+        Haz cualquier pregunta matemática o solicita visualizaciones como gráficos y diagramas.
+        El tutor puede resolver problemas paso a paso y crear visualizaciones interactivas.
         """
     )
     
@@ -171,48 +208,83 @@ with gr.Blocks(
     
     # Chatbot principal
     chatbot = gr.Chatbot(
-        label="Math Tutor Assistant",
+        label="Tutor de Matemáticas IA",
         bubble_full_width=False,
         height=500,
         elem_id="chatbot",
-        show_copy_button=True
+        show_copy_button=True,
+        render_markdown=True
     )
     
-    # Caja de mensaje con ejemplos
-    msg_box = gr.Textbox(
-        label="Your message:",
-        placeholder="Try: 'Draw a graph of y = sin(x)' or 'Explain the quadratic formula'",
-        lines=2,
-        max_lines=4
-    )
-    
-    # Botones de control
+    # Área de entrada
     with gr.Row():
-        submit_btn = gr.Button("Send", variant="primary")
-        clear_btn = gr.Button("New Chat", variant="secondary")
+        msg_box = gr.Textbox(
+            label="Tu mensaje:",
+            placeholder="Ejemplo: 'Dibuja la gráfica de y = sin(x)' o 'Explica la fórmula cuadrática'",
+            lines=2,
+            scale=4
+        )
+        with gr.Column(scale=1):
+            submit_btn = gr.Button("Enviar", variant="primary", size="lg")
+            clear_btn = gr.Button("Nueva Conversación", variant="secondary")
     
-    # Ejemplos predefinidos
-    gr.Examples(
-        examples=[
-            "Draw a graph of y = x^2 - 4x + 3",
-            "Explain the derivative of sin(x)",
-            "What is the Pythagorean theorem?",
-            "Plot the function f(x) = e^(-x) * cos(2πx)",
-            "Solve the equation: 2x^2 + 5x - 3 = 0",
-        ],
-        inputs=msg_box,
-        label="Example Questions"
-    )
+    # Ejemplos
+    with gr.Accordion("📚 Ejemplos de Preguntas", open=False):
+        gr.Examples(
+            examples=[
+                "Dibuja la gráfica de y = x^2 - 4x + 3",
+                "Explica la derivada de sin(x) paso a paso",
+                "¿Qué es el teorema de Pitágoras? Muéstrame un ejemplo visual",
+                "Grafica la función f(x) = e^(-x) * cos(2πx)",
+                "Resuelve la ecuación: 2x^2 + 5x - 3 = 0",
+                "Visualiza la distribución normal con media 0 y desviación estándar 1",
+                "Muestra cómo calcular el área bajo la curva de y = x^2 entre 0 y 2",
+                "Explica visualmente qué es una integral definida",
+            ],
+            inputs=msg_box,
+            label="Haz clic en un ejemplo para usarlo"
+        )
+    
+    # Estado del sistema
+    with gr.Accordion("🔧 Estado del Sistema", open=False):
+        status_html = gr.HTML(value=get_status_html())
+        refresh_btn = gr.Button("🔄 Actualizar Estado", size="sm")
+    
+    # Información adicional
+    with gr.Accordion("ℹ️ Acerca de este Tutor", open=False):
+        gr.Markdown(
+            """
+            Este Tutor de Matemáticas IA utiliza Azure AI Foundry Agent Service con capacidades de Code Interpreter para:
+            
+            - **Resolver problemas matemáticos** paso a paso
+            - **Generar visualizaciones** y gráficos interactivos
+            - **Explicar conceptos complejos** de forma clara
+            - **Proporcionar experiencias de aprendizaje** personalizadas
+            
+            ### Capacidades:
+            - ✅ Álgebra y Cálculo
+            - ✅ Estadística y Probabilidad
+            - ✅ Geometría y Trigonometría
+            - ✅ Visualización de funciones
+            - ✅ Análisis numérico
+            
+            ### Cómo usar:
+            1. Escribe tu pregunta matemática en el cuadro de texto
+            2. Haz clic en "Enviar" o presiona Enter
+            3. Espera la respuesta (puede incluir gráficos generados)
+            4. Continúa la conversación o inicia una nueva
+            """
+        )
     
     # Configurar eventos
     msg_box.submit(
-        handle_submit, 
-        [msg_box, chatbot, thread_id], 
+        process_message,
+        [msg_box, chatbot, thread_id],
         [msg_box, chatbot, thread_id]
     )
     
     submit_btn.click(
-        handle_submit,
+        process_message,
         [msg_box, chatbot, thread_id],
         [msg_box, chatbot, thread_id]
     )
@@ -223,28 +295,33 @@ with gr.Blocks(
         [msg_box, chatbot, thread_id]
     )
     
-    # Información de estado
-    gr.Markdown(
-        f"""
-        ---
-        **Backend Status:** {'✅ Connected' if BACKEND_URL and not BACKEND_URL.startswith('http://localhost') else '⚠️ Check configuration'}
-        
-        <details>
-        <summary>ℹ️ About this tutor</summary>
-        
-        This AI Math Tutor uses Azure AI Foundry Agent Service with Code Interpreter capabilities to:
-        - Solve mathematical problems step by step
-        - Generate visualizations and graphs
-        - Explain complex mathematical concepts
-        - Provide interactive learning experiences
-        </details>
-        """
+    refresh_btn.click(
+        get_status_html,
+        [],
+        [status_html]
+    )
+    
+    # Inicializar al cargar
+    demo.load(
+        start_new_chat,
+        [],
+        [thread_id]
     )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    logger.info(f"Starting Gradio app on port {port}")
+    
+    logger.info("="*50)
+    logger.info("Starting Math Tutor Frontend")
+    logger.info(f"Port: {port}")
     logger.info(f"Backend URL: {BACKEND_URL}")
+    logger.info("="*50)
+    
+    # Verificar conexión inicial con el backend
+    if backend_client.check_health():
+        logger.info("✅ Backend connection successful")
+    else:
+        logger.warning("⚠️ Cannot connect to backend - frontend will start anyway")
     
     demo.launch(
         server_name="0.0.0.0",

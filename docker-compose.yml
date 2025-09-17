@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: math-tutor-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PROJECT_ENDPOINT=${PROJECT_ENDPOINT}
+      - MODEL_DEPLOYMENT_NAME=${MODEL_DEPLOYMENT_NAME:-gpt-4o}
+      - STORAGE_ACCOUNT_NAME=${STORAGE_ACCOUNT_NAME}
+      - IMAGES_CONTAINER_NAME=${IMAGES_CONTAINER_NAME:-images}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID:-}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./backend:/app
+      - ~/.azure:/root/.azure
+    networks:
+      - math-tutor-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: math-tutor-frontend
+    ports:
+      - "7860:7860"
+    environment:
+      - BACKEND_URI=http://backend:8000
+      - PORT=7860
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./frontend:/app
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - math-tutor-network
+
+networks:
+  math-tutor-network:
+    driver: bridge

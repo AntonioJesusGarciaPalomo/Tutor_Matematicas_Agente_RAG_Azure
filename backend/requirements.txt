@@ -1,6 +1,27 @@
-fastapi
-uvicorn
-azure-ai-projects
-azure-identity
-python-dotenv
-azure-storage-blob --pre
+# Core Framework
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# Azure SDKs
+azure-ai-projects==1.0.0b1
+azure-identity==1.17.1
+azure-storage-blob==12.22.0
+azure-core==1.30.2
+
+# Utilidades
+python-dotenv==1.0.1
+pydantic==2.8.2
+
+# Logging y monitoreo (opcional pero recomendado)
+python-json-logger==2.0.7
+
+# Para desarrollo y testing
+httpx==0.27.0  # Cliente HTTP para testing
+pytest==8.3.2
+pytest-asyncio==0.23.8
+
+# Dependencias adicionales de azure-ai-projects
+azure-ai-inference==1.0.0b5
+azure-ai-ml==1.0.0
+opentelemetry-api==1.25.0
+opentelemetry-sdk==1.25.0
