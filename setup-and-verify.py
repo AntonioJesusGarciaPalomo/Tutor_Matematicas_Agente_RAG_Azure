@@ -2,6 +2,12 @@
 """
 Script de configuración y verificación para desarrollo local
 Ejecutar con: python setup-and-verify.py
+
+VERSIÓN SIMPLIFICADA:
+- No crea scripts (deben estar en el repo)
+- Solo verifica y configura el entorno
+- Mejor detección de OS y rutas
+- Más robusto y limpio
 """
 
 import os
@@ -9,9 +15,10 @@ import sys
 import subprocess
 import json
 import time
-import requests
+import platform
+import shutil
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 import logging
 
 # Configurar logging
@@ -21,14 +28,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Colores para output
+# Colores para output (desactivar en Windows sin soporte ANSI)
 class Colors:
-    RED = '\033[0;31m'
-    GREEN = '\033[0;32m'
-    YELLOW = '\033[1;33m'
-    BLUE = '\033[0;34m'
-    CYAN = '\033[0;36m'
-    NC = '\033[0m'  # No Color
+    if platform.system() == 'Windows':
+        try:
+            import colorama
+            colorama.init()
+            RED = '\033[0;31m'
+            GREEN = '\033[0;32m'
+            YELLOW = '\033[1;33m'
+            BLUE = '\033[0;34m'
+            CYAN = '\033[0;36m'
+            NC = '\033[0m'
+        except ImportError:
+            RED = GREEN = YELLOW = BLUE = CYAN = NC = ''
+    else:
+        RED = '\033[0;31m'
+        GREEN = '\033[0;32m'
+        YELLOW = '\033[1;33m'
+        BLUE = '\033[0;34m'
+        CYAN = '\033[0;36m'
+        NC = '\033[0m'
 
 def print_colored(message: str, color: str = Colors.NC):
     """Imprime mensaje con color"""
@@ -42,26 +62,38 @@ def print_header(title: str):
 
 def print_step(step: str, status: str = ""):
     """Imprime un paso del proceso"""
-    if status == "OK":
-        print(f"  {Colors.GREEN}✅{Colors.NC} {step}")
-    elif status == "ERROR":
-        print(f"  {Colors.RED}❌{Colors.NC} {step}")
-    elif status == "WARNING":
-        print(f"  {Colors.YELLOW}⚠️{Colors.NC} {step}")
-    else:
-        print(f"  {Colors.BLUE}▶{Colors.NC} {step}")
+    icons = {
+        "OK": f"{Colors.GREEN}✅{Colors.NC}",
+        "ERROR": f"{Colors.RED}❌{Colors.NC}",
+        "WARNING": f"{Colors.YELLOW}⚠️{Colors.NC}",
+        "INFO": f"{Colors.BLUE}ℹ️{Colors.NC}",
+        "": f"{Colors.BLUE}▶{Colors.NC}"
+    }
+    icon = icons.get(status, icons[""])
+    print(f"  {icon} {step}")
 
-def run_command(cmd: List[str], capture: bool = True, check: bool = True) -> Optional[str]:
+def run_command(cmd: List[str], capture: bool = True, check: bool = True, timeout: int = 30) -> Optional[str]:
     """Ejecuta un comando y retorna el output"""
     try:
         if capture:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=check)
+            result = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                text=True, 
+                check=check,
+                timeout=timeout
+            )
             return result.stdout.strip()
         else:
-            subprocess.run(cmd, check=check)
+            subprocess.run(cmd, check=check, timeout=timeout)
             return None
+    except subprocess.TimeoutExpired:
+        logger.error(f"Command timed out: {' '.join(cmd)}")
+        return None
     except subprocess.CalledProcessError as e:
         if check:
+            logger.error(f"Command failed: {' '.join(cmd)}")
+            logger.error(f"Error: {e.stderr}")
             raise
         return None
     except FileNotFoundError:
@@ -75,211 +107,335 @@ class LocalDevSetup:
         self.backend_dir = self.root_dir / "backend"
         self.frontend_dir = self.root_dir / "frontend"
         self.env_file = self.root_dir / ".env"
+        self.env_template = self.root_dir / ".env.template"
         self.errors = []
         self.warnings = []
+        self.is_windows = platform.system() == 'Windows'
+        self.python_cmd = self._get_python_command()
+        
+    def _get_python_command(self) -> str:
+        """Detecta el comando de Python correcto según el OS"""
+        for cmd in ['python3', 'python']:
+            if run_command([cmd, '--version'], check=False):
+                return cmd
+        return 'python'
+    
+    def _get_pip_path(self, venv_dir: Path) -> Path:
+        """Obtiene la ruta correcta de pip según el OS"""
+        if self.is_windows:
+            pip = venv_dir / "Scripts" / "pip.exe"
+        else:
+            pip = venv_dir / "bin" / "pip"
+        
+        if not pip.exists():
+            # Fallback a python -m pip
+            if self.is_windows:
+                python = venv_dir / "Scripts" / "python.exe"
+            else:
+                python = venv_dir / "bin" / "python"
+            return python
+        return pip
         
     def check_prerequisites(self) -> bool:
         """Verifica los prerrequisitos del sistema"""
         print_header("1. Verificando Prerrequisitos")
         
-        prerequisites = {
-            "python3": "Python 3.12+",
-            "pip": "pip",
-            "az": "Azure CLI",
-            "docker": "Docker (opcional)"
-        }
+        prerequisites = [
+            ("Python 3.12+", [self.python_cmd, "--version"], False),
+            ("pip", [self.python_cmd, "-m", "pip", "--version"], False),
+            ("Azure CLI", ["az", "--version"], False),
+            ("Docker", ["docker", "--version"], True),  # opcional
+            ("Make", ["make", "--version"], True),  # opcional
+        ]
         
-        all_ok = True
-        for cmd, name in prerequisites.items():
-            if run_command([cmd, "--version"], check=False):
+        all_required_ok = True
+        
+        for name, cmd, optional in prerequisites:
+            if run_command(cmd, check=False):
                 print_step(f"{name} instalado", "OK")
             else:
-                if cmd == "docker":  # Docker es opcional
+                if optional:
                     print_step(f"{name} no instalado (opcional)", "WARNING")
                     self.warnings.append(f"{name} no está instalado")
                 else:
                     print_step(f"{name} NO instalado", "ERROR")
                     self.errors.append(f"{name} no está instalado")
-                    all_ok = False
+                    all_required_ok = False
         
-        # Verificar versión de Python
-        python_version = sys.version_info
-        if python_version.major == 3 and python_version.minor >= 12:
-            print_step(f"Python {python_version.major}.{python_version.minor} detectado", "OK")
-        else:
-            print_step(f"Python {python_version.major}.{python_version.minor} - Se requiere 3.12+", "WARNING")
-            self.warnings.append("Python version < 3.12")
+        # Verificar versión específica de Python
+        try:
+            version_output = run_command([self.python_cmd, "--version"], check=False)
+            if version_output:
+                import re
+                match = re.search(r'Python (\d+)\.(\d+)', version_output)
+                if match:
+                    major, minor = int(match.group(1)), int(match.group(2))
+                    if major == 3 and minor >= 12:
+                        print_step(f"Python {major}.{minor} verificado", "OK")
+                    elif major == 3 and minor >= 10:
+                        print_step(f"Python {major}.{minor} - Se recomienda 3.12+", "WARNING")
+                        self.warnings.append(f"Python {major}.{minor} < 3.12")
+                    else:
+                        print_step(f"Python {major}.{minor} - Versión muy antigua", "ERROR")
+                        self.errors.append(f"Python {major}.{minor} es demasiado antiguo")
+                        all_required_ok = False
+        except Exception as e:
+            logger.debug(f"Error verificando versión de Python: {e}")
         
-        return all_ok
+        return all_required_ok
     
     def check_azure_auth(self) -> bool:
         """Verifica y configura la autenticación de Azure"""
         print_header("2. Verificando Autenticación de Azure")
         
-        # Verificar si ya está autenticado
         account_info = run_command(["az", "account", "show"], check=False)
         
         if account_info:
             try:
                 account = json.loads(account_info)
-                print_step(f"Autenticado como: {account.get('user', {}).get('name', 'Unknown')}", "OK")
-                print_step(f"Suscripción: {account.get('name', 'Unknown')}", "OK")
+                user_name = account.get('user', {}).get('name', 'Unknown')
+                subscription = account.get('name', 'Unknown')
+                print_step(f"Autenticado como: {user_name}", "OK")
+                print_step(f"Suscripción: {subscription}", "OK")
                 return True
             except json.JSONDecodeError:
-                pass
+                print_step("Error parseando información de cuenta", "WARNING")
         
         print_step("No autenticado en Azure", "WARNING")
-        response = input("\n  ¿Deseas autenticarte ahora? (s/n): ").lower()
+        response = input("\n  ¿Deseas autenticarte ahora? (s/n): ").lower().strip()
         
         if response == 's':
             print_step("Ejecutando 'az login'...")
-            run_command(["az", "login"], capture=False)
-            return True
+            try:
+                run_command(["az", "login"], capture=False)
+                return True
+            except:
+                self.errors.append("Fallo al autenticar con Azure")
+                return False
         else:
-            self.warnings.append("No autenticado en Azure")
+            self.warnings.append("No autenticado en Azure - algunos features no funcionarán")
             return False
     
     def setup_virtual_environments(self) -> bool:
-        """Crea los entornos virtuales"""
+        """Crea los entornos virtuales si no existen"""
         print_header("3. Configurando Entornos Virtuales")
         
-        all_ok = True
+        success = True
         
-        # Backend venv
-        backend_venv = self.backend_dir / ".venv"
-        if not backend_venv.exists():
-            print_step("Creando venv para backend...")
-            run_command([sys.executable, "-m", "venv", str(backend_venv)])
-            print_step("Venv del backend creado", "OK")
-        else:
-            print_step("Venv del backend ya existe", "OK")
+        for name, venv_dir in [("Backend", self.backend_dir / ".venv"), 
+                                ("Frontend", self.frontend_dir / ".venv")]:
+            if not venv_dir.exists():
+                print_step(f"Creando venv para {name}...")
+                try:
+                    run_command([self.python_cmd, "-m", "venv", str(venv_dir)])
+                    print_step(f"Venv del {name} creado", "OK")
+                except Exception as e:
+                    print_step(f"Error creando venv para {name}: {e}", "ERROR")
+                    self.errors.append(f"Failed to create {name} venv")
+                    success = False
+            else:
+                print_step(f"Venv del {name} ya existe", "OK")
         
-        # Frontend venv
-        frontend_venv = self.frontend_dir / ".venv"
-        if not frontend_venv.exists():
-            print_step("Creando venv para frontend...")
-            run_command([sys.executable, "-m", "venv", str(frontend_venv)])
-            print_step("Venv del frontend creado", "OK")
-        else:
-            print_step("Venv del frontend ya existe", "OK")
-        
-        return all_ok
+        return success
     
     def install_dependencies(self) -> bool:
         """Instala las dependencias de Python"""
         print_header("4. Instalando Dependencias")
         
-        all_ok = True
+        success = True
         
-        # Backend dependencies
-        print_step("Instalando dependencias del backend...")
-        backend_pip = self.backend_dir / ".venv" / "bin" / "pip"
-        if not backend_pip.exists():
-            backend_pip = self.backend_dir / ".venv" / "Scripts" / "pip.exe"
+        for name, proj_dir in [("Backend", self.backend_dir), 
+                               ("Frontend", self.frontend_dir)]:
+            
+            venv_dir = proj_dir / ".venv"
+            req_file = proj_dir / "requirements.txt"
+            
+            if not req_file.exists():
+                print_step(f"requirements.txt no encontrado para {name}", "ERROR")
+                self.errors.append(f"{name} requirements.txt missing")
+                success = False
+                continue
+            
+            print_step(f"Instalando dependencias del {name}...")
+            
+            pip_path = self._get_pip_path(venv_dir)
+            
+            try:
+                # Actualizar pip primero
+                if pip_path.name.endswith('python') or pip_path.name.endswith('python.exe'):
+                    # Usar python -m pip
+                    run_command([str(pip_path), "-m", "pip", "install", "--upgrade", "pip"], 
+                               capture=False, timeout=60)
+                    run_command([str(pip_path), "-m", "pip", "install", "-r", str(req_file)], 
+                               capture=False, timeout=300)
+                else:
+                    # Usar pip directamente
+                    run_command([str(pip_path), "install", "--upgrade", "pip"], 
+                               capture=False, timeout=60)
+                    run_command([str(pip_path), "install", "-r", str(req_file)], 
+                               capture=False, timeout=300)
+                
+                print_step(f"Dependencias del {name} instaladas", "OK")
+                
+            except Exception as e:
+                print_step(f"Error instalando dependencias del {name}: {e}", "ERROR")
+                self.errors.append(f"Failed to install {name} dependencies")
+                success = False
         
-        try:
-            run_command([str(backend_pip), "install", "--upgrade", "pip"], capture=False)
-            run_command([str(backend_pip), "install", "-r", str(self.backend_dir / "requirements.txt")], capture=False)
-            print_step("Dependencias del backend instaladas", "OK")
-        except Exception as e:
-            print_step(f"Error instalando dependencias del backend: {e}", "ERROR")
-            self.errors.append("Failed to install backend dependencies")
-            all_ok = False
-        
-        # Frontend dependencies
-        print_step("Instalando dependencias del frontend...")
-        frontend_pip = self.frontend_dir / ".venv" / "bin" / "pip"
-        if not frontend_pip.exists():
-            frontend_pip = self.frontend_dir / ".venv" / "Scripts" / "pip.exe"
-        
-        try:
-            run_command([str(frontend_pip), "install", "--upgrade", "pip"], capture=False)
-            run_command([str(frontend_pip), "install", "-r", str(self.frontend_dir / "requirements.txt")], capture=False)
-            print_step("Dependencias del frontend instaladas", "OK")
-        except Exception as e:
-            print_step(f"Error instalando dependencias del frontend: {e}", "ERROR")
-            self.errors.append("Failed to install frontend dependencies")
-            all_ok = False
-        
-        # Copiar auth_config.py al backend si no existe
+        # Verificar auth_config.py
         auth_config_path = self.backend_dir / "auth_config.py"
         if not auth_config_path.exists():
-            print_step("Creando auth_config.py...")
-            # Aquí podrías copiar el archivo o crearlo
-            print_step("auth_config.py necesita ser creado manualmente", "WARNING")
-            self.warnings.append("auth_config.py needs to be created")
+            print_step("auth_config.py no existe", "WARNING")
+            self.warnings.append("auth_config.py missing - authentication may fail")
+        else:
+            print_step("auth_config.py encontrado", "OK")
         
-        return all_ok
+        return success
     
     def check_env_file(self) -> bool:    
-        """Verifica el archivo .env sin modificarlo"""
+        """Verifica y configura el archivo .env"""
         print_header("5. Verificando Configuración (.env)")
         
         if not self.env_file.exists():
-            print_step(".env NO existe", "ERROR")
-            print_step("Por favor, crea un .env basado en .env.template", "ERROR")
-            self.errors.append(".env file missing")
-            return False
+            print_step(".env NO existe", "WARNING")
+            
+            if self.env_template.exists():
+                response = input("\n  ¿Deseas crear .env desde .env.template? (s/n): ").lower().strip()
+                if response == 's':
+                    shutil.copy(self.env_template, self.env_file)
+                    print_step(".env creado desde template", "OK")
+                    print_step("⚠️ Edita .env con tus valores de Azure antes de continuar", "WARNING")
+                    self.warnings.append(".env creado pero necesita configuración")
+                else:
+                    print_step("Necesitas crear .env manualmente", "ERROR")
+                    self.errors.append(".env file missing")
+                    return False
+            else:
+                print_step(".env.template tampoco existe", "ERROR")
+                self.errors.append("Both .env and .env.template missing")
+                return False
         
-        # Solo leer y verificar, sin modificar
+        # Leer y verificar variables
         env_vars = {}
-        with open(self.env_file, 'r') as f:
+        with open(self.env_file, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith('#') and '=' in line:
                     key, value = line.split('=', 1)
-                    env_vars[key] = value
+                    env_vars[key.strip()] = value.strip()
         
-        # Verificar variables requeridas
-        required_vars = ["PROJECT_ENDPOINT", "STORAGE_ACCOUNT_NAME", "MODEL_DEPLOYMENT_NAME"]
+        # Variables críticas requeridas
+        required_vars = {
+            "PROJECT_ENDPOINT": "Endpoint del proyecto AI",
+            "STORAGE_ACCOUNT_NAME": "Nombre de la cuenta de storage",
+            "MODEL_DEPLOYMENT_NAME": "Nombre del modelo desplegado"
+        }
+        
         missing_vars = []
+        configured_vars = []
         
-        for var in required_vars:
-            if var not in env_vars or not env_vars[var]:
-                missing_vars.append(var)
-                print_step(f"{var}: NO CONFIGURADO", "ERROR")
-            else:
-                # Mostrar solo primeros caracteres por seguridad
-                value_preview = env_vars[var][:20] + "..." if len(env_vars[var]) > 20 else "***"
+        for var, description in required_vars.items():
+            if var in env_vars and env_vars[var]:
+                value_preview = env_vars[var][:30] + "..." if len(env_vars[var]) > 30 else "***"
                 print_step(f"{var}: {value_preview}", "OK")
+                configured_vars.append(var)
+            else:
+                print_step(f"{var}: NO CONFIGURADO ({description})", "ERROR")
+                missing_vars.append(var)
+        
+        # Variables opcionales pero recomendadas
+        optional_vars = {
+            "AZURE_CLIENT_ID": "Service Principal ID",
+            "DEBUG": "Modo debug",
+            "ENVIRONMENT": "Entorno (local/azure)"
+        }
+        
+        for var, description in optional_vars.items():
+            if var in env_vars and env_vars[var]:
+                print_step(f"{var}: configurado", "INFO")
+            else:
+                print_step(f"{var}: no configurado ({description})", "INFO")
         
         if missing_vars:
-            self.errors.append(f"Variables faltantes: {', '.join(missing_vars)}")
+            self.errors.append(f"Variables críticas faltantes: {', '.join(missing_vars)}")
             return False
+        
+        # Copiar .env a subdirectorios si no existen
+        for subdir in [self.backend_dir, self.frontend_dir]:
+            subdir_env = subdir / ".env"
+            if not subdir_env.exists():
+                shutil.copy(self.env_file, subdir_env)
+                print_step(f".env copiado a {subdir.name}/", "OK")
+            else:
+                print_step(f"{subdir.name}/.env ya existe", "INFO")
         
         print_step(".env verificado correctamente", "OK")
         return True
-        
     
-    def test_backend(self) -> bool:
-        """Prueba que el backend funciona correctamente"""
-        print_header("6. Verificando Backend")
+    def verify_scripts(self) -> bool:
+        """Verifica que los scripts de ejecución existen"""
+        print_header("6. Verificando Scripts de Ejecución")
         
-        # Iniciar backend temporalmente
-        print_step("Iniciando backend para pruebas...")
+        # Scripts esperados según el OS
+        if self.is_windows:
+            expected_scripts = {
+                "run-local.bat": "Ejecutar backend + frontend",
+                "run-local.ps1": "Ejecutar con PowerShell (opcional)",
+            }
+        else:
+            expected_scripts = {
+                "run-local.sh": "Ejecutar backend + frontend",
+                "run-backend.sh": "Solo backend",
+                "run-frontend.sh": "Solo frontend",
+            }
         
-        backend_python = self.backend_dir / ".venv" / "bin" / "python"
-        if not backend_python.exists():
-            backend_python = self.backend_dir / ".venv" / "Scripts" / "python.exe"
+        # Scripts opcionales multiplataforma
+        optional_scripts = {
+            "Makefile": "Comandos make",
+            "docker-compose.yml": "Ejecución con Docker",
+            "test-api.py": "Tests de API",
+        }
         
-        # Iniciar proceso del backend
-        backend_process = subprocess.Popen(
-            [str(backend_python), "main.py"],
-            cwd=str(self.backend_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
+        all_ok = True
         
-        # Esperar a que inicie
-        print_step("Esperando a que el backend inicie...")
-        time.sleep(5)
+        # Verificar scripts principales
+        for script, description in expected_scripts.items():
+            script_path = self.root_dir / script
+            if script_path.exists():
+                print_step(f"{script}: {description}", "OK")
+                
+                # Verificar permisos de ejecución en Unix
+                if not self.is_windows and script.endswith('.sh'):
+                    import stat
+                    st = os.stat(script_path)
+                    if not (st.st_mode & stat.S_IEXEC):
+                        print_step(f"  Agregando permisos de ejecución a {script}", "INFO")
+                        os.chmod(script_path, st.st_mode | stat.S_IEXEC)
+            else:
+                print_step(f"{script}: NO ENCONTRADO - {description}", "ERROR")
+                self.errors.append(f"Script {script} missing")
+                all_ok = False
         
-        # Verificar health endpoint
+        # Verificar scripts opcionales
+        for script, description in optional_scripts.items():
+            if (self.root_dir / script).exists():
+                print_step(f"{script}: {description}", "INFO")
+        
+        return all_ok
+    
+    def test_backend_connection(self) -> bool:
+        """Verifica si el backend está ejecutándose"""
+        print_header("7. Verificando Conexión con Backend")
+        
+        print_step("Intentando conectar con el backend...")
+        
         try:
-            response = requests.get("http://localhost:8000/health", timeout=5)
+            import requests
+            response = requests.get("http://localhost:8000/health", timeout=2)
+            
             if response.status_code == 200:
                 health_data = response.json()
-                print_step(f"Backend respondiendo: {health_data['status']}", "OK")
+                print_step(f"Backend respondiendo: {health_data.get('status', 'unknown')}", "OK")
                 
                 # Verificar componentes
                 if health_data.get('agent_ready'):
@@ -294,485 +450,230 @@ class LocalDevSetup:
                     print_step("Storage no conectado", "WARNING")
                     self.warnings.append("Storage not connected")
                 
-                backend_ok = True
-            else:
-                print_step(f"Backend respondió con error: {response.status_code}", "ERROR")
-                backend_ok = False
+                return True
+                
+        except requests.exceptions.ConnectionError:
+            print_step("Backend no está ejecutándose", "INFO")
+            print_step("Ejecuta './run-backend.sh' o 'make run-backend' para iniciarlo", "INFO")
+            
+        except ImportError:
+            print_step("Módulo 'requests' no instalado en el entorno global", "WARNING")
+            
         except Exception as e:
-            print_step(f"No se pudo conectar al backend: {e}", "ERROR")
-            self.errors.append("Backend connection failed")
-            backend_ok = False
+            print_step(f"Error verificando backend: {e}", "WARNING")
         
-        # Detener el backend
-        backend_process.terminate()
-        time.sleep(2)
-        
-        return backend_ok
-    
-    def test_integration(self) -> bool:
-        """Prueba la integración completa"""
-        print_header("7. Prueba de Integración")
-        
-        print_step("Verificando scripts de ejecución...")
-        
-        scripts_ok = True
-        for script in ["run-local.sh", "run-backend.sh", "run-frontend.sh"]:
-            if (self.root_dir / script).exists():
-                print_step(f"Script {script} existe", "OK")
-            else:
-                print_step(f"Script {script} no existe", "WARNING")
-                self.warnings.append(f"Script {script} missing")
-        
-        return scripts_ok
+        return True  # No es crítico que el backend esté corriendo durante setup
     
     def verify_azure_resources(self) -> bool:
         """Verifica que los recursos de Azure están disponibles"""
         print_header("8. Verificando Recursos de Azure")
         
+        if not self.env_file.exists():
+            print_step(".env no existe, saltando verificación de Azure", "WARNING")
+            return True
+        
         # Leer configuración
         env_vars = {}
-        if self.env_file.exists():
-            with open(self.env_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, value = line.split('=', 1)
-                        env_vars[key] = value
+        with open(self.env_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    env_vars[key.strip()] = value.strip()
         
         # Verificar AI Project endpoint
-        project_endpoint = env_vars.get("PROJECT_ENDPOINT")
+        project_endpoint = env_vars.get("PROJECT_ENDPOINT", "")
         if project_endpoint:
-            print_step(f"Project Endpoint configurado: {project_endpoint[:50]}...", "OK")
+            print_step(f"Project Endpoint configurado", "OK")
+            
+            # Validar formato básico del endpoint
+            if "azure" in project_endpoint.lower() or "api" in project_endpoint.lower():
+                print_step("Formato del endpoint parece correcto", "OK")
+            else:
+                print_step("Formato del endpoint puede ser incorrecto", "WARNING")
+                self.warnings.append("PROJECT_ENDPOINT format may be incorrect")
         else:
             print_step("Project Endpoint no configurado", "ERROR")
             self.errors.append("PROJECT_ENDPOINT not configured")
         
         # Verificar Storage Account
-        storage_account = env_vars.get("STORAGE_ACCOUNT_NAME")
+        storage_account = env_vars.get("STORAGE_ACCOUNT_NAME", "")
         if storage_account:
             print_step(f"Storage Account: {storage_account}", "OK")
             
-            # Verificar que existe usando Azure CLI
-            result = run_command([
-                "az", "storage", "account", "show",
-                "--name", storage_account
-            ], check=False)
-            
-            if result:
-                print_step("Storage Account verificado en Azure", "OK")
-            else:
-                print_step("Storage Account no encontrado en Azure", "WARNING")
-                self.warnings.append("Storage Account not found in Azure")
+            # Intentar verificar en Azure (solo si está autenticado)
+            if run_command(["az", "account", "show"], check=False):
+                result = run_command([
+                    "az", "storage", "account", "show",
+                    "--name", storage_account
+                ], check=False)
+                
+                if result:
+                    print_step("Storage Account verificado en Azure", "OK")
+                else:
+                    print_step("Storage Account no encontrado o sin permisos", "WARNING")
+                    self.warnings.append("Cannot verify Storage Account in Azure")
         else:
             print_step("Storage Account no configurado", "ERROR")
             self.errors.append("STORAGE_ACCOUNT_NAME not configured")
         
-        return len(self.errors) == 0
-    
-    def create_helper_scripts(self) -> bool:
-        """Crea scripts auxiliares para desarrollo"""
-        print_header("9. Creando Scripts de Ayuda")
-        
-        scripts = {
-            "run-local.sh": self.get_run_local_script(),
-            "run-backend.sh": self.get_run_backend_script(),
-            "run-frontend.sh": self.get_run_frontend_script(),
-            "test-local.sh": self.get_test_local_script(),
-            "run-local.bat": self.get_run_local_bat(),
-            "test-api.py": self.get_test_api_script()
-        }
-        
-        for filename, content in scripts.items():
-            filepath = self.root_dir / filename
-            with open(filepath, 'w') as f:
-                f.write(content)
-            
-            # Hacer ejecutable en Unix
-            if filename.endswith('.sh'):
-                import stat
-                st = os.stat(filepath)
-                os.chmod(filepath, st.st_mode | stat.S_IEXEC)
-            
-            print_step(f"{filename} creado", "OK")
-        
-        return True
-    
-    def get_run_local_script(self) -> str:
-        return '''#!/bin/bash
-echo "🚀 Iniciando Math Tutor en modo local..."
-echo "========================================="
-
-# Función para matar procesos al salir
-cleanup() {
-    echo -e "\\n🛑 Deteniendo servicios..."
-    kill $BACKEND_PID $FRONTEND_PID 2>/dev/null
-    exit
-}
-
-trap cleanup EXIT INT TERM
-
-# Iniciar backend
-echo "▶️ Iniciando Backend en http://localhost:8000"
-cd backend
-source .venv/bin/activate
-export ENVIRONMENT=local
-export DEBUG=true
-python main.py &
-BACKEND_PID=$!
-cd ..
-
-# Esperar a que el backend esté listo
-echo "⏳ Esperando a que el backend esté listo..."
-for i in {1..30}; do
-    if curl -s http://localhost:8000/health > /dev/null 2>&1; then
-        echo "✅ Backend está listo"
-        break
-    fi
-    if [ $i -eq 30 ]; then
-        echo "❌ El backend no responde después de 30 segundos"
-        exit 1
-    fi
-    sleep 1
-done
-
-# Iniciar frontend
-echo "▶️ Iniciando Frontend en http://localhost:7860"
-cd frontend
-source .venv/bin/activate
-export BACKEND_URI=http://localhost:8000
-python app.py &
-FRONTEND_PID=$!
-cd ..
-
-echo ""
-echo "========================================="
-echo "✅ Servicios iniciados:"
-echo "   - Backend:  http://localhost:8000"
-echo "   - Frontend: http://localhost:7860"
-echo "   - API Docs: http://localhost:8000/docs"
-echo "   - Health:   http://localhost:8000/health"
-echo ""
-echo "📝 Logs:"
-echo "   - Presiona Ctrl+C para detener ambos servicios"
-echo "========================================="
-
-# Mantener el script ejecutándose
-wait
-'''
-    
-    def get_run_backend_script(self) -> str:
-        return '''#!/bin/bash
-echo "🚀 Iniciando Backend..."
-cd backend
-source .venv/bin/activate
-export ENVIRONMENT=local
-export DEBUG=true
-python main.py
-'''
-    
-    def get_run_frontend_script(self) -> str:
-        return '''#!/bin/bash
-echo "🚀 Iniciando Frontend..."
-cd frontend
-source .venv/bin/activate
-export BACKEND_URI=http://localhost:8000
-python app.py
-'''
-    
-    def get_test_local_script(self) -> str:
-        return '''#!/bin/bash
-echo "🧪 Ejecutando Tests Locales..."
-echo "=============================="
-
-# Test Backend Health
-echo ""
-echo "1. Testing Backend Health..."
-curl -s http://localhost:8000/health | python -m json.tool
-
-# Test Backend Detailed Health
-echo ""
-echo "2. Testing Backend Detailed Health..."
-curl -s http://localhost:8000/health/detailed | python -m json.tool
-
-# Test Start Chat
-echo ""
-echo "3. Testing Start Chat..."
-RESPONSE=$(curl -s -X POST http://localhost:8000/start_chat)
-echo $RESPONSE | python -m json.tool
-THREAD_ID=$(echo $RESPONSE | python -c "import sys, json; print(json.load(sys.stdin)['thread_id'])")
-
-# Test Send Message
-echo ""
-echo "4. Testing Send Message..."
-curl -s -X POST http://localhost:8000/chat \\
-  -H "Content-Type: application/json" \\
-  -d "{
-    \\"thread_id\\": \\"$THREAD_ID\\",
-    \\"message\\": \\"¿Cuánto es 2+2?\\"
-  }" | python -m json.tool
-
-echo ""
-echo "✅ Tests completados"
-'''
-    
-    def get_run_local_bat(self) -> str:
-        return '''@echo off
-echo 🚀 Iniciando Math Tutor en modo local...
-echo =========================================
-
-REM Iniciar backend
-echo ▶️ Iniciando Backend en http://localhost:8000
-start /B cmd /c "cd backend && .venv\\Scripts\\activate && set ENVIRONMENT=local && set DEBUG=true && python main.py"
-
-REM Esperar 5 segundos
-timeout /t 5 /nobreak > nul
-
-REM Iniciar frontend
-echo ▶️ Iniciando Frontend en http://localhost:7860
-start /B cmd /c "cd frontend && .venv\\Scripts\\activate && set BACKEND_URI=http://localhost:8000 && python app.py"
-
-echo.
-echo =========================================
-echo ✅ Servicios iniciados:
-echo    - Backend:  http://localhost:8000
-echo    - Frontend: http://localhost:7860
-echo    - API Docs: http://localhost:8000/docs
-echo.
-echo 📝 Cierra esta ventana para detener los servicios
-echo =========================================
-
-pause
-'''
-    
-    def get_test_api_script(self) -> str:
-        return '''#!/usr/bin/env python3
-"""Script de prueba de API para desarrollo local"""
-
-import requests
-import json
-import time
-from typing import Dict, Any
-
-BASE_URL = "http://localhost:8000"
-
-def test_health():
-    """Prueba el endpoint de health"""
-    print("\\n📍 Testing /health...")
-    response = requests.get(f"{BASE_URL}/health")
-    if response.status_code == 200:
-        data = response.json()
-        print(f"✅ Status: {data['status']}")
-        print(f"   Environment: {data.get('environment', 'unknown')}")
-        print(f"   Agent Ready: {data.get('agent_ready', False)}")
-        print(f"   Storage Ready: {data.get('storage_ready', False)}")
-        return True
-    else:
-        print(f"❌ Error: {response.status_code}")
-        return False
-
-def test_detailed_health():
-    """Prueba el health detallado"""
-    print("\\n📍 Testing /health/detailed...")
-    response = requests.get(f"{BASE_URL}/health/detailed")
-    if response.status_code == 200:
-        data = response.json()
-        print(f"✅ Status: {data['status']}")
-        print(f"   Auth Method: {data.get('checks', {}).get('auth_method', 'unknown')}")
-        print(f"   Agent Count: {data.get('checks', {}).get('agent_count', 0)}")
-        if data.get('errors'):
-            print(f"   ⚠️ Errors: {', '.join(data['errors'])}")
-        return True
-    else:
-        print(f"❌ Error: {response.status_code}")
-        return False
-
-def test_chat_flow():
-    """Prueba el flujo completo de chat"""
-    print("\\n📍 Testing chat flow...")
-    
-    # 1. Iniciar chat
-    print("   1. Starting chat...")
-    response = requests.post(f"{BASE_URL}/start_chat")
-    if response.status_code != 200:
-        print(f"   ❌ Failed to start chat: {response.status_code}")
-        return False
-    
-    chat_data = response.json()
-    thread_id = chat_data['thread_id']
-    print(f"   ✅ Thread ID: {thread_id}")
-    
-    # 2. Enviar mensaje simple
-    print("   2. Sending test message...")
-    message_data = {
-        "thread_id": thread_id,
-        "message": "¿Cuánto es 2 + 2?"
-    }
-    
-    start_time = time.time()
-    response = requests.post(
-        f"{BASE_URL}/chat",
-        json=message_data,
-        timeout=60
-    )
-    elapsed = time.time() - start_time
-    
-    if response.status_code == 200:
-        reply_data = response.json()
-        reply = reply_data['reply'][:100] + "..." if len(reply_data['reply']) > 100 else reply_data['reply']
-        print(f"   ✅ Got reply in {elapsed:.2f}s: {reply}")
-        
-        if reply_data.get('image_url'):
-            print(f"   🖼️ Image generated: {reply_data['image_url']}")
-        
-        return True
-    else:
-        print(f"   ❌ Failed to send message: {response.status_code}")
-        if response.text:
-            print(f"   Error: {response.text[:200]}")
-        return False
-
-def test_visualization():
-    """Prueba la generación de visualizaciones"""
-    print("\\n📍 Testing visualization...")
-    
-    # Iniciar chat
-    response = requests.post(f"{BASE_URL}/start_chat")
-    if response.status_code != 200:
-        print(f"   ❌ Failed to start chat")
-        return False
-    
-    thread_id = response.json()['thread_id']
-    
-    # Pedir una visualización
-    message_data = {
-        "thread_id": thread_id,
-        "message": "Dibuja la gráfica de y = sin(x) desde -2π hasta 2π"
-    }
-    
-    print("   Requesting visualization (this may take a while)...")
-    response = requests.post(
-        f"{BASE_URL}/chat",
-        json=message_data,
-        timeout=90
-    )
-    
-    if response.status_code == 200:
-        reply_data = response.json()
-        if reply_data.get('image_url'):
-            print(f"   ✅ Visualization generated: {reply_data['image_url']}")
-            return True
-        else:
-            print(f"   ⚠️ No image generated, but got response")
-            return True
-    else:
-        print(f"   ❌ Failed: {response.status_code}")
-        return False
-
-def main():
-    print("="*60)
-    print("🧪 Math Tutor API Test Suite")
-    print("="*60)
-    
-    # Verificar que el backend está disponible
-    try:
-        requests.get(f"{BASE_URL}/health", timeout=2)
-    except:
-        print("\\n❌ Backend no está disponible en {BASE_URL}")
-        print("   Asegúrate de que el backend está ejecutándose")
-        return
-    
-    # Ejecutar tests
-    results = []
-    
-    results.append(("Health Check", test_health()))
-    results.append(("Detailed Health", test_detailed_health()))
-    results.append(("Chat Flow", test_chat_flow()))
-    results.append(("Visualization", test_visualization()))
-    
-    # Resumen
-    print("\\n" + "="*60)
-    print("📊 Test Results Summary")
-    print("="*60)
-    
-    passed = sum(1 for _, result in results if result)
-    total = len(results)
-    
-    for test_name, result in results:
-        status = "✅ PASSED" if result else "❌ FAILED"
-        print(f"  {test_name}: {status}")
-    
-    print(f"\\n  Total: {passed}/{total} tests passed")
-    
-    if passed == total:
-        print("\\n🎉 All tests passed!")
-    else:
-        print(f"\\n⚠️ {total - passed} tests failed")
-
-if __name__ == "__main__":
-    main()
-'''
+        return len([e for e in self.errors if "Azure" in e]) == 0
     
     def print_summary(self):
-        """Imprime un resumen final"""
-        print_header("RESUMEN DE CONFIGURACIÓN")
+        """Imprime un resumen final con recomendaciones"""
+        print_header("📊 RESUMEN DE CONFIGURACIÓN")
+        
+        total_errors = len(self.errors)
+        total_warnings = len(self.warnings)
         
         if self.errors:
-            print_colored("\n❌ ERRORES ENCONTRADOS:", Colors.RED)
+            print_colored(f"\n❌ {total_errors} ERRORES ENCONTRADOS:", Colors.RED)
             for error in self.errors:
                 print(f"  • {error}")
         
         if self.warnings:
-            print_colored("\n⚠️ ADVERTENCIAS:", Colors.YELLOW)
+            print_colored(f"\n⚠️ {total_warnings} ADVERTENCIAS:", Colors.YELLOW)
             for warning in self.warnings:
                 print(f"  • {warning}")
         
         if not self.errors:
             print_colored("\n✅ CONFIGURACIÓN EXITOSA", Colors.GREEN)
-            print("\n📋 Próximos pasos:")
-            print("  1. Verifica que el archivo .env tiene todas las variables configuradas")
-            print("  2. Ejecuta los servicios:")
-            print("     • En Unix/Mac: ./run-local.sh")
-            print("     • En Windows: run-local.bat")
-            print("     • O por separado:")
-            print("       - ./run-backend.sh")
-            print("       - ./run-frontend.sh")
-            print("  3. Abre http://localhost:7860 en tu navegador")
-            print("  4. Para probar la API: python test-api.py")
-            print("\n💡 Tips:")
-            print("  • Revisa los logs en backend.log")
-            print("  • API Docs disponible en http://localhost:8000/docs")
-            print("  • Health check en http://localhost:8000/health")
+            
+            print("\n📋 PRÓXIMOS PASOS:")
+            print_colored("─" * 40, Colors.CYAN)
+            
+            if self.env_file.exists():
+                env_configured = True
+                with open(self.env_file, 'r') as f:
+                    content = f.read()
+                    if 'YOUR_' in content or 'REPLACE_' in content:
+                        env_configured = False
+                
+                if not env_configured:
+                    print("  1. ⚠️ Edita .env con tus valores reales de Azure")
+                else:
+                    print("  1. ✅ .env parece estar configurado")
+            
+            print("\n  2. 🚀 EJECUTAR LA APLICACIÓN:")
+            
+            if self.is_windows:
+                print(f"     {Colors.CYAN}Opción A:{Colors.NC} run-local.bat")
+                print(f"     {Colors.CYAN}Opción B:{Colors.NC} make run-local")
+                print(f"     {Colors.CYAN}Opción C:{Colors.NC} docker-compose up")
+            else:
+                print(f"     {Colors.CYAN}Opción A:{Colors.NC} ./run-local.sh")
+                print(f"     {Colors.CYAN}Opción B:{Colors.NC} make run-local")
+                print(f"     {Colors.CYAN}Opción C:{Colors.NC} docker-compose up")
+            
+            print("\n  3. 🌐 ABRIR EN EL NAVEGADOR:")
+            print(f"     Frontend: {Colors.CYAN}http://localhost:7860{Colors.NC}")
+            print(f"     API Docs: {Colors.CYAN}http://localhost:8000/docs{Colors.NC}")
+            
+            print("\n💡 COMANDOS ÚTILES:")
+            print_colored("─" * 40, Colors.CYAN)
+            print(f"  {Colors.GREEN}make help{Colors.NC}          - Ver todos los comandos disponibles")
+            print(f"  {Colors.GREEN}make test{Colors.NC}          - Ejecutar tests")
+            print(f"  {Colors.GREEN}make logs-backend{Colors.NC}  - Ver logs del backend")
+            print(f"  {Colors.GREEN}make health-check{Colors.NC}  - Verificar estado de servicios")
+            
+            if self.warnings:
+                print(f"\n📝 Nota: Hay {total_warnings} advertencias que podrías revisar")
+                
         else:
             print_colored("\n❌ CONFIGURACIÓN INCOMPLETA", Colors.RED)
-            print("Por favor, resuelve los errores antes de continuar")
+            print("\nPor favor, resuelve los errores antes de continuar.")
+            print("\nPosibles soluciones:")
+            
+            if any("Python" in e for e in self.errors):
+                print("  • Instala Python 3.12+: https://www.python.org/downloads/")
+            if any("Azure CLI" in e for e in self.errors):
+                print("  • Instala Azure CLI: https://docs.microsoft.com/cli/azure/install")
+            if any(".env" in e for e in self.errors):
+                print("  • Crea .env desde .env.template y configura las variables")
+            if any("Script" in e for e in self.errors):
+                print("  • Verifica que todos los scripts estén en el repositorio")
     
     def run(self):
         """Ejecuta todo el proceso de setup"""
-        print_colored("\n🚀 MATH TUTOR - SETUP DE DESARROLLO LOCAL", Colors.CYAN)
+        print_colored("\n🚀 MATH TUTOR - VERIFICACIÓN DE DESARROLLO LOCAL", Colors.CYAN)
+        print("="*60)
+        print(f"Sistema Operativo: {platform.system()} {platform.release()}")
+        print(f"Python: {self.python_cmd}")
+        print(f"Directorio: {self.root_dir}")
         print("="*60)
         
         # Ejecutar verificaciones
         steps = [
-            ("Prerrequisitos", self.check_prerequisites),
-            ("Autenticación Azure", self.check_azure_auth),
-            ("Entornos Virtuales", self.setup_virtual_environments),
-            ("Dependencias", self.install_dependencies),
-            ("Configuración .env", self.check_env_file),
-            ("Backend", self.test_backend),
-            ("Integración", self.test_integration),
-            ("Recursos Azure", self.verify_azure_resources),
-            ("Scripts Helper", self.create_helper_scripts)
+            ("Prerrequisitos", self.check_prerequisites, True),   # Crítico
+            ("Autenticación Azure", self.check_azure_auth, False), # No crítico
+            ("Entornos Virtuales", self.setup_virtual_environments, True), # Crítico
+            ("Dependencias", self.install_dependencies, True),     # Crítico
+            ("Configuración .env", self.check_env_file, True),    # Crítico
+            ("Scripts", self.verify_scripts, True),               # Crítico
+            ("Backend", self.test_backend_connection, False),     # No crítico
+            ("Recursos Azure", self.verify_azure_resources, False), # No crítico
         ]
         
-        for step_name, step_func in steps:
-            if not step_func():
-                if self.errors and step_name in ["Prerrequisitos", "Configuración .env"]:
-                    print_colored(f"\n⛔ Setup detenido por errores críticos en {step_name}", Colors.RED)
+        for step_name, step_func, is_critical in steps:
+            try:
+                if not step_func():
+                    if is_critical and self.errors:
+                        print_colored(f"\n⛔ Setup detenido por errores críticos en: {step_name}", Colors.RED)
+                        break
+            except Exception as e:
+                logger.error(f"Error ejecutando {step_name}: {e}")
+                if is_critical:
+                    self.errors.append(f"Critical error in {step_name}: {str(e)}")
                     break
+                else:
+                    self.warnings.append(f"Non-critical error in {step_name}: {str(e)}")
         
         # Mostrar resumen
         self.print_summary()
 
-if __name__ == "__main__":
+def main():
+    """Función principal con manejo de argumentos"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Setup y verificación para desarrollo local de Math Tutor'
+    )
+    parser.add_argument(
+        '--fix', 
+        action='store_true', 
+        help='Intenta corregir problemas automáticamente'
+    )
+    parser.add_argument(
+        '--verbose', 
+        action='store_true', 
+        help='Muestra información detallada de debug'
+    )
+    
+    args = parser.parse_args()
+    
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
     setup = LocalDevSetup()
-    setup.run()
+    
+    try:
+        setup.run()
+        
+        # Retornar código de salida apropiado
+        if setup.errors:
+            sys.exit(1)  # Hay errores
+        elif setup.warnings:
+            sys.exit(0)  # Solo warnings, pero OK
+        else:
+            sys.exit(0)  # Todo perfecto
+            
+    except KeyboardInterrupt:
+        print_colored("\n\n⚠️ Setup interrumpido por el usuario", Colors.YELLOW)
+        sys.exit(130)
+    except Exception as e:
+        print_colored(f"\n❌ Error inesperado: {e}", Colors.RED)
+        logger.exception("Unexpected error")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
