@@ -130,9 +130,20 @@ az-set-subscription: ## Configura la suscripción de Azure
 
 provision: ## Aprovisiona la infraestructura en Azure
 	@echo "$(YELLOW)🏗️ Aprovisionando infraestructura en Azure...$(NC)"
-	@source .env && azd env set AZURE_LOCATION $$AZURE_LOCATION
+	@if [ -f ".env" ]; then \
+		source .env && azd env set AZURE_LOCATION $$AZURE_LOCATION; \
+	fi
 	@azd provision
 	@echo "$(GREEN)✅ Infraestructura aprovisionada$(NC)"
+
+provision-local: ## Aprovisiona infraestructura mínima para desarrollo local
+	@echo "$(YELLOW)🏗️ Aprovisionando infraestructura local en Azure...$(NC)"
+	@if [ -f "deploy-local-dev.sh" ]; then \
+		./deploy-local-dev.sh; \
+	else \
+		echo "$(RED)❌ deploy-local-dev.sh no encontrado$(NC)"; \
+		exit 1; \
+	fi
 
 deploy: ## Despliega la aplicación en Azure
 	@echo "$(YELLOW)🚀 Desplegando aplicación en Azure...$(NC)"
