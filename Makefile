@@ -130,6 +130,7 @@ az-set-subscription: ## Configura la suscripción de Azure
 
 provision: ## Aprovisiona la infraestructura en Azure
 	@echo "$(YELLOW)🏗️ Aprovisionando infraestructura en Azure...$(NC)"
+	@source .env && azd env set AZURE_LOCATION $$AZURE_LOCATION
 	@azd provision
 	@echo "$(GREEN)✅ Infraestructura aprovisionada$(NC)"
 

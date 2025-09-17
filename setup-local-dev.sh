@@ -92,6 +92,18 @@ else
     echo -e "${GREEN}✅ Archivo .env encontrado${NC}"
 fi
 
+# Configurar Azure Location en azd si está disponible
+if [ -f ".env" ]; then
+    AZURE_LOCATION=$(grep "^AZURE_LOCATION=" .env | cut -d '=' -f2)
+    if [ -n "$AZURE_LOCATION" ]; then
+        # Solo configurar si azd está instalado
+        if command -v azd &> /dev/null; then
+            azd env set AZURE_LOCATION $AZURE_LOCATION 2>/dev/null
+            echo -e "${GREEN}✅ Región de Azure configurada: $AZURE_LOCATION${NC}"
+        fi
+    fi
+fi
+
 # 6. Copiar .env a los directorios
 cp .env backend/.env
 cp .env frontend/.env

@@ -96,6 +96,23 @@ if (-not $account) {
 Write-Host "  ✅ Autenticado como: $($account.user.name)" -ForegroundColor Green
 Write-Host "  📍 Suscripción: $($account.name)" -ForegroundColor Cyan
 
+# Configurar Azure Location desde .env si existe
+Write-Host "`n📍 Configurando región de Azure..." -ForegroundColor Yellow
+if (Test-Path ".env") {
+    $envContent = Get-Content ".env" -Raw
+    if ($envContent -match "AZURE_LOCATION=(.+)") {
+        $location = $matches[1].Trim()
+        if (Get-Command azd -ErrorAction SilentlyContinue) {
+            azd env set AZURE_LOCATION $location 2>$null
+            Write-Host "  ✅ Región configurada: $location" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  ⚠️ AZURE_LOCATION no encontrada en .env, usando default" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "  ℹ️ Archivo .env no encontrado aún" -ForegroundColor Gray
+}
+
 # Verificar que el resource group existe
 Write-Host "`n🔍 Verificando Resource Group..." -ForegroundColor Yellow
 $rgExists = az group exists --name $ResourceGroup 2>$null
