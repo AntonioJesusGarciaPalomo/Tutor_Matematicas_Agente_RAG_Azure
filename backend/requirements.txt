@@ -1,27 +1,35 @@
-# Core Framework
-fastapi==0.111.0
-uvicorn[standard]==0.30.1
+# ================================================
+# BACKEND REQUIREMENTS - VERSIÓN ACTUALIZADA
+# ================================================
+# Compatible con Azure AI Foundry Agent Service
+# Actualizado: Enero 2025
 
-# Azure SDKs
-azure-ai-projects==1.0.0b1
-azure-identity==1.17.1
-azure-storage-blob==12.22.0
-azure-core==1.30.2
+# Core Framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# Azure AI SDKs - IMPORTANTE: El orden importa
+azure-ai-projects  # Usa la última versión disponible
+azure-identity==1.19.0
+azure-storage-blob==12.23.1
+azure-core==1.32.0
+
+# Dependencias adicionales de Azure AI
+azure-ai-inference  # Requerido por azure-ai-projects
+opentelemetry-api==1.29.0
+opentelemetry-sdk==1.29.0
 
 # Utilidades
 python-dotenv==1.0.1
-pydantic==2.8.2
+pydantic==2.10.3
 
-# Logging y monitoreo (opcional pero recomendado)
-python-json-logger==2.0.7
+# Logging y monitoreo
+python-json-logger==3.2.0
 
-# Para desarrollo y testing
-httpx==0.27.0  # Cliente HTTP para testing
-pytest==8.3.2
-pytest-asyncio==0.23.8
+# Para desarrollo y testing (opcional)
+httpx==0.28.1
+pytest==8.3.4
+pytest-asyncio==0.25.0
 
-# Dependencias adicionales de azure-ai-projects
-azure-ai-inference==1.0.0b5
-azure-ai-ml==1.0.0
-opentelemetry-api==1.25.0
-opentelemetry-sdk==1.25.0
+# NOTA: Si azure.ai.agents.models no funciona, el código debe usar:
+# from azure.ai.projects.models import CodeInterpreterTool

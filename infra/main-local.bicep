@@ -7,12 +7,10 @@
 // - Key Vault (required by AI Hub)
 // - Application Insights (for telemetry)
 
-targetScope = 'subscription'
+// IMPORTANTE: Cambiado de 'subscription' a 'resourceGroup'
+targetScope = 'resourceGroup'
 
 // Parameters
-@description('Name of the resource group')
-param resourceGroupName string = 'rg-aifoundry-local'
-
 @description('Azure region for resources')
 @allowed([
   'eastus'
@@ -41,25 +39,17 @@ param tags object = {
   ManagedBy: 'azd'
 }
 
-// Variables
-var uniqueSuffix = uniqueString(subscription().id, environmentName, location)
+// Variables - usando resourceGroup().name para obtener el nombre
+var uniqueSuffix = uniqueString(resourceGroup().id, environmentName, location)
 var aiHubName = 'hub-local-${uniqueSuffix}'
 var aiProjectName = 'proj-tutor-local-${uniqueSuffix}'
-var storageAccountName = 'stlocal${replace(uniqueSuffix, '-', '')}' // Storage names can't have dashes
+var storageAccountName = toLower('stlocal${replace(uniqueSuffix, '-', '')}')
 var keyVaultName = 'kv-local-${uniqueSuffix}'
 var appInsightsName = 'appi-local-${uniqueSuffix}'
 var logAnalyticsName = 'log-local-${uniqueSuffix}'
 
-// Resource Group
-resource rg 'Microsoft.Resources/resourceGroups@2022-09-01' = {
-  name: resourceGroupName
-  location: location
-  tags: tags
-}
-
 // Log Analytics Workspace (required for Application Insights)
 module logAnalytics 'modules-local/log-analytics.bicep' = {
-  scope: rg
   name: 'logAnalyticsDeploy'
   params: {
     name: logAnalyticsName
@@ -70,7 +60,6 @@ module logAnalytics 'modules-local/log-analytics.bicep' = {
 
 // Application Insights (required for AI Hub)
 module appInsights 'modules-local/app-insights.bicep' = {
-  scope: rg
   name: 'appInsightsDeploy'
   params: {
     name: appInsightsName
@@ -82,7 +71,6 @@ module appInsights 'modules-local/app-insights.bicep' = {
 
 // Key Vault (required for AI Hub)
 module keyVault 'modules-local/key-vault.bicep' = {
-  scope: rg
   name: 'keyVaultDeploy'
   params: {
     name: keyVaultName
@@ -93,7 +81,6 @@ module keyVault 'modules-local/key-vault.bicep' = {
 
 // Storage Account
 module storage 'modules-local/storage.bicep' = {
-  scope: rg
   name: 'storageDeploy'
   params: {
     name: storageAccountName
@@ -105,7 +92,6 @@ module storage 'modules-local/storage.bicep' = {
 
 // AI Hub
 module aiHub 'modules-local/ai-hub.bicep' = {
-  scope: rg
   name: 'aiHubDeploy'
   params: {
     name: aiHubName
@@ -119,7 +105,6 @@ module aiHub 'modules-local/ai-hub.bicep' = {
 
 // AI Project
 module aiProject 'modules-local/ai-project.bicep' = {
-  scope: rg
   name: 'aiProjectDeploy'
   params: {
     name: aiProjectName
@@ -129,40 +114,24 @@ module aiProject 'modules-local/ai-project.bicep' = {
   }
 }
 
-// Outputs - Using AZURE_ prefix for azd to recognize them automatically
-output AZURE_PROJECT_ENDPOINT string = aiProject.outputs.endpoint
-output AZURE_STORAGE_ACCOUNT_NAME string = storage.outputs.name
-output AZURE_STORAGE_ACCOUNT_KEY string = storage.outputs.key
-output AZURE_STORAGE_CONNECTION_STRING string = storage.outputs.connectionString
-output AZURE_KEY_VAULT_NAME string = keyVault.outputs.name
-output AZURE_KEY_VAULT_ENDPOINT string = keyVault.outputs.endpoint
-output AZURE_AI_HUB_NAME string = aiHub.outputs.name
-output AZURE_AI_PROJECT_NAME string = aiProject.outputs.name
-output AZURE_APPLICATION_INSIGHTS_CONNECTION_STRING string = appInsights.outputs.connectionString
-output AZURE_RESOURCE_GROUP_NAME string = rg.name
-
-// Legacy outputs for backward compatibility
+// Outputs principales para el proyecto
 output PROJECT_ENDPOINT string = aiProject.outputs.endpoint
 output STORAGE_ACCOUNT_NAME string = storage.outputs.name
 output STORAGE_ACCOUNT_KEY string = storage.outputs.key
-output STORAGE_CONNECTION_STRING string = storage.outputs.connectionString
 output KEY_VAULT_NAME string = keyVault.outputs.name
-output KEY_VAULT_ENDPOINT string = keyVault.outputs.endpoint
 output AI_HUB_NAME string = aiHub.outputs.name
 output AI_PROJECT_NAME string = aiProject.outputs.name
-output APPLICATION_INSIGHTS_CONNECTION_STRING string = appInsights.outputs.connectionString
-output RESOURCE_GROUP_NAME string = rg.name
 
-// Display important information
-output IMPORTANT_INFO object = {
+// Información adicional
+output DEPLOYMENT_INFO object = {
   message: 'Local development resources created successfully!'
-  next_steps: [
-    '1. Run: python setup-and-verify.py'
-    '2. Start backend: cd backend && python main.py'
-    '3. Start frontend: cd frontend && python app.py'
-    '4. Open browser: http://localhost:7860'
-  ]
-  resource_group: rg.name
+  resource_group: resourceGroup().name
   ai_project: aiProjectName
   storage_account: storageAccountName
+  next_steps: [
+    '1. The .env file has been created automatically'
+    '2. Run: python setup-and-verify.py'
+    '3. Start services: ./run-local.sh or run-local.bat'
+    '4. Open browser: http://localhost:7860'
+  ]
 }

@@ -16,4 +16,7 @@ resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
 
 output id string = logAnalytics.id
 output customerId string = logAnalytics.properties.customerId
+
+// Suprimir warning de seguridad para la clave compartida
+#disable-next-line outputs-should-not-contain-secrets
 output primarySharedKey string = logAnalytics.listKeys().primarySharedKey
