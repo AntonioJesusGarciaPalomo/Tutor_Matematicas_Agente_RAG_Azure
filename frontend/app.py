@@ -399,7 +399,7 @@ with gr.Blocks(theme=gr.themes.Soft(
         elem_id="chatbot",
         show_copy_button=True,
         render_markdown=True,
-        avatar_images=(None, "🤖")
+        avatar_images=(None, None)
     )
     
     # Área de entrada mejorada
@@ -482,8 +482,8 @@ with gr.Blocks(theme=gr.themes.Soft(
             """
         )
     
-    # Timer para auto-actualización (simulado con JavaScript)
-    auto_refresh_timer = gr.Timer(30, active=False)
+    # # Timer para auto-actualización (simulado con JavaScript)
+    # auto_refresh_timer = gr.Timer(30, active=False)
     
     # Configurar eventos
     msg_box.submit(
@@ -510,21 +510,21 @@ with gr.Blocks(theme=gr.themes.Soft(
         [status_html]
     )
     
-    # Auto-refresh cuando está activado
-    def toggle_auto_refresh(checked):
-        return gr.Timer(active=checked)
+    # # Auto-refresh cuando está activado
+    # def toggle_auto_refresh(checked):
+    #     return gr.Timer(active=checked)
     
-    auto_refresh.change(
-        toggle_auto_refresh,
-        [auto_refresh],
-        [auto_refresh_timer]
-    )
+    # auto_refresh.change(
+    #     toggle_auto_refresh,
+    #     [auto_refresh],
+    #     [auto_refresh_timer]
+    # )
     
-    auto_refresh_timer.tick(
-        refresh_status,
-        [],
-        [status_html]
-    )
+    # auto_refresh_timer.tick(
+    #     refresh_status,
+    #     [],
+    #     [status_html]
+    # )
     
     # Inicializar al cargar
     demo.load(

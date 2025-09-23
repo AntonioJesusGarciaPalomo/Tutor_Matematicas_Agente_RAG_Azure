@@ -1,3 +1,4 @@
+import sys
 import os
 import io
 import logging
@@ -20,6 +21,13 @@ from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.core.exceptions import ResourceNotFoundError, AzureError
 
 from dotenv import load_dotenv
+
+API_KEY = os.environ.get("API_KEY")
+PROJECT_ENDPOINT = os.environ.get("PROJECT_ENDPOINT")
+
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # Importar la configuración de autenticación mejorada
 try:
@@ -162,9 +170,10 @@ def retry(max_attempts=3, delay=2, backoff=2, exceptions=(Exception,)):
 
 # --- CONFIGURACIÓN DE CREDENCIALES ---
 def get_credential():
-    """Obtiene las credenciales usando la configuración mejorada"""
+    """Obtiene las credenciales usando DefaultAzureCredential"""
     try:
-        credential = AzureAuthConfig.get_credential()
+        from azure.identity import DefaultAzureCredential
+        credential = DefaultAzureCredential()
         logger.info("✅ Credenciales configuradas correctamente")
         return credential
     except Exception as e:
@@ -186,29 +195,22 @@ container_client = None
 def initialize_azure_clients():
     """Inicializa los clientes de Azure con mejor manejo de errores"""
     global project_client, blob_service_client, container_client
-    
+
     if not credential:
         logger.error("❌ No hay credenciales disponibles")
         return False
-    
+
     success = True
-    
-    # AI Project Client
+
+    # AI Project Client - No cerrar cliente anterior    
+
     if project_endpoint:
         try:
             project_client = AIProjectClient(
-                endpoint=project_endpoint, 
+                endpoint=project_endpoint,
                 credential=credential
             )
             logger.info("✅ AI Project Client inicializado")
-            
-            # Verificar conexión listando agentes (si existen)
-            with project_client:
-                try:
-                    # Nota: No usamos list() directamente, solo verificamos que podemos acceder
-                    logger.info("   Conexión verificada con AI Project")
-                except Exception as e:
-                    logger.debug(f"   No se pudieron listar agentes existentes: {e}")
         except Exception as e:
             logger.error(f"❌ Error inicializando AI Project Client: {e}")
             project_client = None
@@ -247,12 +249,26 @@ def initialize_azure_clients():
 # Intentar inicializar clientes
 clients_initialized = initialize_azure_clients()
 
+def get_fresh_project_client():
+    """Obtiene un cliente de proyecto fresco para evitar problemas de conexión HTTP"""
+
+    if not credential or not project_endpoint:
+        raise Exception("Credenciales o endpoint no configurados")
+    
+    # Crear nuevo cliente con las credenciales correctas
+    new_project_client = AIProjectClient(
+        endpoint=project_endpoint,
+        credential=credential
+    )
+
+    logger.debug("🔄 Cliente de proyecto recreado")
+    return new_project_client
+
 # --- GESTIÓN DE AGENTES MEJORADA ---
 class AgentManager:
     """Gestiona la creación y reutilización de agentes usando el patrón del ejemplo oficial"""
-    
-    def __init__(self, project_client: Optional[AIProjectClient]):
-        self.project_client = project_client
+
+    def __init__(self):
         self.agent_id: Optional[str] = None
         self.agent_name: str = AGENT_NAME
         self._last_check_time = 0
@@ -261,76 +277,70 @@ class AgentManager:
     
     @retry(max_attempts=3, delay=2, exceptions=(AzureError, Exception))
     def get_or_create_agent(self) -> str:
-        """Obtiene un agente existente o crea uno nuevo siguiendo el patrón oficial"""
-        
-        if not self.project_client:
-            raise Exception("Project client no inicializado")
-        
+        """Obtiene un agente existente o crea uno nuevo"""
+
         current_time = time.time()
-        
-        # Usar cache si es reciente
-        if self.agent_id and (current_time - self._last_check_time) < self._check_interval:
-            logger.debug(f"Usando agente en cache: {self.agent_id}")
-            return self.agent_id
-        
+
         try:
-            with self.project_client:
-                # Intentar listar agentes existentes
+            fresh_client = get_fresh_project_client()
+            
+            # Si tenemos un AGENT_ID en el ambiente, usamos ese
+            agent_id_env = os.environ.get("AGENT_ID")
+            if agent_id_env:
                 try:
-                    # El método exacto puede variar según la versión del SDK
-                    # Algunos SDKs usan list_agents(), otros usan list()
-                    agents = []
-                    if hasattr(self.project_client.agents, 'list'):
-                        agents = list(self.project_client.agents.list())
-                    elif hasattr(self.project_client.agents, 'list_agents'):
-                        agents = list(self.project_client.agents.list_agents())
-                    
-                    logger.info(f"📋 Agentes encontrados: {len(agents)}")
-                    
-                    # Buscar agente existente
-                    for agent in agents:
-                        if hasattr(agent, 'name') and agent.name == self.agent_name:
-                            self.agent_id = agent.id
-                            self._last_check_time = current_time
-                            logger.info(f"✅ Usando agente existente: {self.agent_id}")
-                            return self.agent_id
+                    # Intentar obtener el agente existente
+                    agent = fresh_client.agents.get_agent(agent_id_env)
+                    logger.info(f"✅ Usando agente existente: {agent.id}")
+                    self.agent_id = agent.id
+                    self.agent = agent
+                    return agent.id
                 except Exception as e:
-                    logger.debug(f"No se pudieron listar agentes: {e}")
-                
-                # Crear nuevo agente siguiendo el ejemplo oficial
-                logger.info(f"🔨 Creando nuevo agente: {self.agent_name}")
-                
-                code_interpreter = CodeInterpreterTool()
-                
-                agent = self.project_client.agents.create_agent(
-                    model=model_deployment_name,
-                    name=self.agent_name,
-                    instructions="""Eres un tutor de matemáticas experto y amigable.
-                    
-                    Tus capacidades incluyen:
-                    - Resolver problemas matemáticos paso a paso
-                    - Crear visualizaciones y gráficos usando matplotlib
-                    - Explicar conceptos complejos de forma clara
-                    - Proporcionar ejemplos prácticos
-                    
-                    Siempre:
-                    - Muestra tu trabajo paso a paso
-                    - Explica tu razonamiento
-                    - Crea visualizaciones cuando sean útiles
-                    - Responde en el mismo idioma que la pregunta del usuario
-                    
-                    Para crear gráficos usa matplotlib y guarda las imágenes.
-                    """,
-                    tools=code_interpreter.definitions,
-                    temperature=0.7,
-                    top_p=0.95
-                )
-                
-                self.agent_id = agent.id
-                self._last_check_time = current_time
-                logger.info(f"✅ Agente creado exitosamente: {self.agent_id}")
-                
-                return self.agent_id
+                    logger.warning(f"No se pudo obtener el agente {agent_id_env}: {e}")
+                    # Continuar para crear uno nuevo si falla
+            
+            # Buscar agente existente por nombre
+            agents = fresh_client.agents.list_agents()
+            for agent in agents:
+                if agent.name == self.agent_name:
+                    logger.info(f"✅ Agente existente encontrado: {agent.id}")
+                    self.agent_id = agent.id
+                    self.agent = agent
+                    return agent.id
+            
+            # Crear nuevo agente
+            logger.info(f"🔨 Creando nuevo agente: {self.agent_name}")
+            
+            code_interpreter = CodeInterpreterTool()
+            
+            agent = fresh_client.agents.create_agent(
+                model=model_deployment_name,
+                name=self.agent_name,
+                instructions="""Eres un tutor de matemáticas experto y amigable.
+
+                Tus capacidades incluyen:
+                - Resolver problemas matemáticos paso a paso
+                - Crear visualizaciones y gráficos usando matplotlib
+                - Explicar conceptos complejos de forma clara
+                - Proporcionar ejemplos prácticos
+
+                Siempre:
+                - Muestra tu trabajo paso a paso
+                - Explica tu razonamiento
+                - Crea visualizaciones cuando sean útiles
+                - Responde en el mismo idioma que la pregunta del usuario
+
+                Para crear gráficos usa matplotlib y guarda las imágenes.
+                """,
+                tools=code_interpreter.definitions,
+                temperature=0.7,
+                top_p=0.95
+            )
+            
+            self.agent_id = agent.id
+            self._last_check_time = current_time
+            logger.info(f"✅ Agente creado exitosamente: {self.agent_id}")
+            
+            return self.agent_id
                 
         except Exception as e:
             logger.error(f"❌ Error gestionando agente: {e}")
@@ -340,17 +350,19 @@ class AgentManager:
     
     def create_thread(self) -> str:
         """Crea un nuevo thread siguiendo el patrón del ejemplo oficial"""
-        if not self.project_client:
-            raise Exception("Project client no inicializado")
-        
-        with self.project_client:
-            # Crear thread según el ejemplo oficial
-            thread = self.project_client.agents.threads.create()
+        try:
+            # Usar cliente fresco para evitar problemas de conexión HTTP
+            fresh_client = get_fresh_project_client()
+            # NO usar with statement
+            thread = fresh_client.agents.threads.create()
             thread_id = thread.id if hasattr(thread, 'id') else str(thread)
             self.active_threads[thread_id] = thread
             logger.info(f"📝 Thread creado: {thread_id}")
             logger.debug(f"   Threads activos: {len(self.active_threads)}")
             return thread_id
+        except Exception as e:
+            logger.error(f"Error creando thread: {e}")
+            raise
     
     def cleanup_thread(self, thread_id: str):
         """Limpia un thread de la memoria"""
@@ -376,7 +388,7 @@ class AgentManager:
         }
 
 # Inicializar el manager
-agent_manager = AgentManager(project_client) if project_client else None
+agent_manager = AgentManager() if credential and project_endpoint else None
 
 # --- MODELOS DE DATOS ---
 class ChatRequest(BaseModel):
@@ -441,8 +453,10 @@ async def health_check():
             try:
                 agent_id = agent_manager.get_or_create_agent()
                 agent_ready = bool(agent_id)
+                logger.debug(f"Agent check successful: {agent_id}")
             except Exception as e:
-                logger.debug(f"Agent check failed: {e}")
+                logger.error(f"Agent check failed: {e}")
+                logger.debug(f"Agent check error details: {str(e)}", exc_info=True)
         
         # Verificar storage
         if container_client:
@@ -566,82 +580,86 @@ async def chat(request: ChatRequest):
     try:
         agent_id = agent_manager.get_or_create_agent()
         
-        with project_client:
-            # Log del mensaje
-            logger.info(f"💬 Procesando mensaje para thread {request.thread_id[:8]}...")
-            logger.debug(f"   Mensaje: {request.message[:100]}...")
-            
-            # Agregar mensaje del usuario - siguiendo el patrón oficial
-            message = project_client.agents.messages.create(
-                thread_id=request.thread_id,
-                role="user",
-                content=request.message,
-            )
-            logger.debug(f"Message created with ID: {message.get('id', 'unknown') if isinstance(message, dict) else getattr(message, 'id', 'unknown')}")
+        # Usar cliente fresco para evitar problemas de conexión HTTP
+        fresh_client = get_fresh_project_client()
 
-            # Crear y procesar el run - siguiendo el patrón oficial
-            logger.info("⚙️ Ejecutando agente...")
-            run = project_client.agents.runs.create_and_process(
-                thread_id=request.thread_id,
-                agent_id=agent_id
-            )
+        
+        # Log del mensaje
+        logger.info(f"💬 Procesando mensaje para thread {request.thread_id[:8]}...")
+        logger.debug(f"   Mensaje: {request.message[:100]}...")
 
-            # Verificar estado del run
-            if run.status == "failed":
-                error_msg = f"Agent run failed: {run.last_error}"
-                logger.error(f"❌ {error_msg}")
+        # Agregar mensaje del usuario - siguiendo el patrón oficial
+        message = fresh_client.agents.messages.create(
+            thread_id=request.thread_id,
+            role="user",
+            content=request.message,
+        )
+    
+        logger.debug(f"Message created with ID: {message.get('id', 'unknown') if isinstance(message, dict) else getattr(message, 'id', 'unknown')}")
+
+        # Crear y procesar el run - siguiendo el patrón oficial
+        logger.info("⚙️ Ejecutando agente...")
+        run = fresh_client.agents.runs.create_and_process(
+            thread_id=request.thread_id,
+            agent_id=agent_id
+        )
+
+        # Verificar estado del run
+        if run.status == "failed":
+            error_msg = f"Agent run failed: {run.last_error}"
+            logger.error(f"❌ {error_msg}")
+
+            if "not found" in str(run.last_error).lower():
+                agent_manager.reset_agent()
+
+            raise HTTPException(status_code=500, detail=error_msg)
+
+        # Obtener mensajes - siguiendo el patrón oficial
+        messages = fresh_client.agents.messages.list(thread_id=request.thread_id)
+        
+        reply = ""
+        image_url = None
+
+        # Procesar respuesta del asistente
+        for message in messages:
+            if message.role == "assistant":
+                # Procesar contenido de texto
+                if hasattr(message, 'content'):
+                    if isinstance(message.content, str):
+                        reply = message.content
+                    elif isinstance(message.content, list):
+                        for content in message.content:
+                            if hasattr(content, 'text'):
+                                if hasattr(content.text, 'value'):
+                                    reply += content.text.value
+                                else:
+                                    reply += str(content.text)
+                            elif isinstance(content, dict) and 'text' in content:
+                                reply += content.get('text', '')
                 
-                if "not found" in str(run.last_error).lower():
-                    agent_manager.reset_agent()
+                # Procesar imágenes - siguiendo el patrón oficial
+                if hasattr(message, 'image_contents') and message.image_contents:
+                    try:
+                        for img in message.image_contents:
+                            file_id = img.image_file.file_id if hasattr(img.image_file, 'file_id') else img.file_id
+                            image_url = process_image(file_id)
+                            break  # Solo procesamos la primera imagen
+                    except Exception as img_error:
+                        logger.error(f"Error procesando imagen: {img_error}")
                 
-                raise HTTPException(status_code=500, detail=error_msg)
-
-            # Obtener mensajes - siguiendo el patrón oficial
-            messages = project_client.agents.messages.list(thread_id=request.thread_id)
-            
-            reply = ""
-            image_url = None
-
-            # Procesar respuesta del asistente
-            for message in messages:
-                if message.role == "assistant":
-                    # Procesar contenido de texto
-                    if hasattr(message, 'content'):
-                        if isinstance(message.content, str):
-                            reply = message.content
-                        elif isinstance(message.content, list):
-                            for content in message.content:
-                                if hasattr(content, 'text'):
-                                    if hasattr(content.text, 'value'):
-                                        reply += content.text.value
-                                    else:
-                                        reply += str(content.text)
-                                elif isinstance(content, dict) and 'text' in content:
-                                    reply += content.get('text', '')
-                    
-                    # Procesar imágenes - siguiendo el patrón oficial
-                    if hasattr(message, 'image_contents') and message.image_contents:
-                        try:
-                            for img in message.image_contents:
-                                file_id = img.image_file.file_id if hasattr(img.image_file, 'file_id') else img.file_id
-                                image_url = process_image(file_id)
-                                break  # Solo procesamos la primera imagen
-                        except Exception as img_error:
-                            logger.error(f"Error procesando imagen: {img_error}")
-                    
-                    break  # Solo necesitamos la respuesta más reciente del asistente
-            
-            if not reply:
-                reply = "No pude generar una respuesta. Por favor, intenta de nuevo."
-            
-            processing_time = time.time() - start_time
-            logger.info(f"✅ Respuesta generada en {processing_time:.2f}s")
-            
-            return ChatResponse(
-                reply=reply, 
-                image_url=image_url,
-                processing_time=processing_time
-            )
+                break  # Solo necesitamos la respuesta más reciente del asistente
+        
+        if not reply:
+            reply = "No pude generar una respuesta. Por favor, intenta de nuevo."
+        
+        processing_time = time.time() - start_time
+        logger.info(f"✅ Respuesta generada en {processing_time:.2f}s")
+        
+        return ChatResponse(
+            reply=reply, 
+            image_url=image_url,
+            processing_time=processing_time
+        )
 
     except HTTPException:
         raise
@@ -668,7 +686,8 @@ def process_image(file_id: str) -> Optional[str]:
         
         # Descargar contenido usando el método del ejemplo oficial
         # Nota: El método save() del ejemplo guarda directamente, nosotros lo subimos a blob
-        file_content = project_client.agents.files.download(file_id=file_id)
+        fresh_client = get_fresh_project_client()
+        file_content = fresh_client.agents.files.download(file_id=file_id)
         
         # Procesar contenido
         if isinstance(file_content, dict):
@@ -729,14 +748,15 @@ async def cleanup_agent():
         )
     
     try:
-        with project_client:
+        fresh_client = get_fresh_project_client()
+        with fresh_client:
             if agent_manager.agent_id:
                 try:
                     # Usar el método correcto según el SDK
-                    if hasattr(project_client.agents, 'delete_agent'):
-                        project_client.agents.delete_agent(agent_manager.agent_id)
-                    elif hasattr(project_client.agents, 'delete'):
-                        project_client.agents.delete(agent_id=agent_manager.agent_id)
+                    if hasattr(fresh_client.agents, 'delete_agent'):
+                        fresh_client.agents.delete_agent(agent_manager.agent_id)
+                    elif hasattr(fresh_client.agents, 'delete'):
+                        fresh_client.agents.delete(agent_id=agent_manager.agent_id)
                     
                     old_id = agent_manager.agent_id
                     agent_manager.reset_agent()
@@ -857,7 +877,7 @@ if __name__ == "__main__":
     
     # Configuración para desarrollo
     port = int(os.environ.get("PORT", 8000))
-    reload = IS_LOCAL and not os.environ.get("NO_RELOAD", False)
+    reload = False  # Temporarily disabled to test agent initialization
     
     uvicorn.run(
         app if not reload else "main:app",

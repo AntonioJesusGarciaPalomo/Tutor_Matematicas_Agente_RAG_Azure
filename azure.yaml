@@ -1,246 +1,179 @@
-name: aifoundry-tutor
+# Azure Developer CLI configuration for LOCAL DEVELOPMENT
+# This creates only the minimal Azure resources needed for local development
+name: aifoundry-tutor-local
 metadata:
-  template: aifoundry-agent-tutor@1.0.0
-services:
-  backend:
-    project: ./backend
-    language: python
-    host: containerapp
-    docker:
-      # Las propiedades 'path' y 'context' se han eliminado para usar las convenciones de azd
-      registry: ${AZURE_CONTAINER_REGISTRY_ENDPOINT}
-    env:
-      PROJECT_ENDPOINT: ${PROJECT_ENDPOINT}
-      MODEL_DEPLOYMENT_NAME: ${MODEL_DEPLOYMENT_NAME}
-      STORAGE_ACCOUNT_NAME: ${STORAGE_ACCOUNT_NAME}
-      IMAGES_CONTAINER_NAME: ${IMAGES_CONTAINER_NAME}
-  
-  frontend:
-    project: ./frontend
-    language: python
-    host: appservice
-    docker:
-      # Las propiedades 'path' y 'context' se han eliminado para usar las convenciones de azd
-      registry: ${AZURE_CONTAINER_REGISTRY_ENDPOINT}
-    env:
-      BACKEND_URI: ${BACKEND_URI}
+  template: aifoundry-agent-local-dev@1.0.0
+  description: Minimal Azure resources for local development of Math Tutor
 
-# Hooks para validación y configuración
+# We only provision Azure some resources (AI Hub, Storage)
+infra:
+  provider: bicep
+  path: infra
+  module: main-local
+
+# Environment variables that will be set after provisioning
+environment:
+  values:
+    # These will be populated by azd after provisioning
+    PROJECT_ENDPOINT: ${PROJECT_ENDPOINT}
+    STORAGE_ACCOUNT_NAME: ${STORAGE_ACCOUNT_NAME}
+    STORAGE_ACCOUNT_KEY: ${STORAGE_ACCOUNT_KEY}
+    KEY_VAULT_NAME: ${KEY_VAULT_NAME}
+    AI_HUB_NAME: ${AI_HUB_NAME}
+    AI_PROJECT_NAME: ${AI_PROJECT_NAME}
+    
+    # Fixed values for local development
+    MODEL_DEPLOYMENT_NAME: gpt-4o
+    IMAGES_CONTAINER_NAME: images
+    ENVIRONMENT: local
+    DEBUG: true
+    
+    # Local URLs
+    BACKEND_URI: http://localhost:8000
+    FRONTEND_URI: http://localhost:7860
+
+# Hooks for automation
 hooks:
-  # Pre-provision: Validaciones antes de crear infraestructura
-  preprovision:
-    windows:
-      shell: pwsh
-      run: |
-        Write-Host "🔍 Validating environment configuration..." -ForegroundColor Yellow
-        
-        # Verificar que tenemos los archivos necesarios
-        if (-not (Test-Path ".env.template")) {
-            Write-Error ".env.template not found!"
-            exit 1
-        }
-        
-        # Verificar estructura de proyecto
-        $required = @("backend", "frontend", "infra")
-        foreach ($dir in $required) {
-            if (-not (Test-Path $dir)) {
-                Write-Error "Directory $dir not found!"
-                exit 1
-            }
-        }
-        
-        Write-Host "✅ Pre-provision validation passed" -ForegroundColor Green
-    posix:
-      shell: sh
-      run: |
-        echo "🔍 Validating environment configuration..."
-        
-        # Verificar archivos necesarios
-        if [ ! -f ".env.template" ]; then
-            echo "Error: .env.template not found!"
-            exit 1
-        fi
-        
-        # Verificar estructura de proyecto
-        for dir in backend frontend infra; do
-            if [ ! -d "$dir" ]; then
-                echo "Error: Directory $dir not found!"
-                exit 1
-            fi
-        done
-        
-        echo "✅ Pre-provision validation passed"
-
-  # Post-provision: Configurar variables después de crear infraestructura
+  # After provisioning, create .env file and setup local environment
   postprovision:
     windows:
       shell: pwsh
       run: |
-        Write-Host "⚙️ Setting environment variables from infrastructure outputs..." -ForegroundColor Yellow
+        Write-Host "🎉 Azure resources provisioned successfully!" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "📝 Creating .env file for local development..." -ForegroundColor Yellow
         
-        # Configurar variables de entorno
-        azd env set PROJECT_ENDPOINT $env:PROJECT_ENDPOINT
-        azd env set BACKEND_URI $env:BACKEND_URI
-        azd env set FRONTEND_URI $env:FRONTEND_URI
-        azd env set STORAGE_ACCOUNT_NAME $env:STORAGE_ACCOUNT_NAME
-        azd env set IMAGES_CONTAINER_NAME $env:IMAGES_CONTAINER_NAME
-        azd env set AZURE_CONTAINER_REGISTRY_ENDPOINT $env:AZURE_CONTAINER_REGISTRY_ENDPOINT
-        azd env set MODEL_DEPLOYMENT_NAME "gpt-4o"
+        # Get the values from azd environment
+        $projectEndpoint = azd env get-value PROJECT_ENDPOINT
+        $storageAccount = azd env get-value STORAGE_ACCOUNT_NAME
+        $storageKey = azd env get-value STORAGE_ACCOUNT_KEY
         
-        # Crear archivo .env local
+        # Create .env file
         @"
-        PROJECT_ENDPOINT=$env:PROJECT_ENDPOINT
+        # ================================================
+        # AUTO-GENERATED CONFIGURATION FOR LOCAL DEVELOPMENT
+        # Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        # ================================================
+        
+        # Azure AI Foundry
+        PROJECT_ENDPOINT=$projectEndpoint
         MODEL_DEPLOYMENT_NAME=gpt-4o
-        STORAGE_ACCOUNT_NAME=$env:STORAGE_ACCOUNT_NAME
-        IMAGES_CONTAINER_NAME=$env:IMAGES_CONTAINER_NAME
-        BACKEND_URI=$env:BACKEND_URI
-        FRONTEND_URI=$env:FRONTEND_URI
-        AZURE_CONTAINER_REGISTRY_ENDPOINT=$env:AZURE_CONTAINER_REGISTRY_ENDPOINT
+        AGENT_NAME=math-tutor-agent
+        
+        # Azure Storage
+        STORAGE_ACCOUNT_NAME=$storageAccount
+        STORAGE_ACCOUNT_KEY=$storageKey
+        IMAGES_CONTAINER_NAME=images
+        
+        # Local Development Settings
+        ENVIRONMENT=local
+        DEBUG=true
+        LOG_LEVEL=INFO
+        
+        # Local Service URLs
+        BACKEND_URI=http://localhost:8000
+        FRONTEND_URI=http://localhost:7860
+        PORT=8000
+        FRONTEND_PORT=7860
+        
+        # Azure Settings
+        AZURE_LOCATION=$env:AZURE_LOCATION
+        RESOURCE_GROUP=rg-aifoundry-local-$env:AZURE_ENV_NAME
         "@ | Out-File -FilePath ".env" -Encoding UTF8
         
-        Write-Host "✅ Environment variables configured" -ForegroundColor Green
+        # Copy to subdirectories
+        Copy-Item ".env" "backend/.env" -Force
+        Copy-Item ".env" "frontend/.env" -Force
+        
+        Write-Host "✅ .env files created successfully!" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "🚀 Next steps:" -ForegroundColor Cyan
+        Write-Host "  1. Run: python setup-and-verify.py" -ForegroundColor White
+        Write-Host "  2. Start services: ./run-local.sh (or run-local.bat on Windows)" -ForegroundColor White
+        Write-Host "  3. Open: http://localhost:7860" -ForegroundColor White
+        
     posix:
       shell: sh
       run: |
-        echo "⚙️ Setting environment variables from infrastructure outputs..."
+        echo "🎉 Azure resources provisioned successfully!"
+        echo ""
+        echo "📝 Creating .env file for local development..."
         
-        # Configurar variables de entorno
-        azd env set PROJECT_ENDPOINT $PROJECT_ENDPOINT
-        azd env set BACKEND_URI $BACKEND_URI
-        azd env set FRONTEND_URI $FRONTEND_URI
-        azd env set STORAGE_ACCOUNT_NAME $STORAGE_ACCOUNT_NAME
-        azd env set IMAGES_CONTAINER_NAME $IMAGES_CONTAINER_NAME
-        azd env set AZURE_CONTAINER_REGISTRY_ENDPOINT $AZURE_CONTAINER_REGISTRY_ENDPOINT
-        azd env set MODEL_DEPLOYMENT_NAME "gpt-4o"
+        # Get the values from azd environment
+        PROJECT_ENDPOINT=$(azd env get-value PROJECT_ENDPOINT)
+        STORAGE_ACCOUNT=$(azd env get-value STORAGE_ACCOUNT_NAME)
+        STORAGE_KEY=$(azd env get-value STORAGE_ACCOUNT_KEY)
+        AZURE_LOCATION=$(azd env get-value AZURE_LOCATION)
         
-        # Crear archivo .env local
+        # Create .env file
         cat > .env << EOF
+        # ================================================
+        # AUTO-GENERATED CONFIGURATION FOR LOCAL DEVELOPMENT
+        # Generated: $(date '+%Y-%m-%d %H:%M:%S')
+        # ================================================
+        
+        # Azure AI Foundry
         PROJECT_ENDPOINT=$PROJECT_ENDPOINT
         MODEL_DEPLOYMENT_NAME=gpt-4o
-        STORAGE_ACCOUNT_NAME=$STORAGE_ACCOUNT_NAME
-        IMAGES_CONTAINER_NAME=$IMAGES_CONTAINER_NAME
-        BACKEND_URI=$BACKEND_URI
-        FRONTEND_URI=$FRONTEND_URI
-        AZURE_CONTAINER_REGISTRY_ENDPOINT=$AZURE_CONTAINER_REGISTRY_ENDPOINT
+        AGENT_NAME=math-tutor-agent
+        
+        # Azure Storage
+        STORAGE_ACCOUNT_NAME=$STORAGE_ACCOUNT
+        STORAGE_ACCOUNT_KEY=$STORAGE_KEY
+        IMAGES_CONTAINER_NAME=images
+        
+        # Local Development Settings
+        ENVIRONMENT=local
+        DEBUG=true
+        LOG_LEVEL=INFO
+        
+        # Local Service URLs
+        BACKEND_URI=http://localhost:8000
+        FRONTEND_URI=http://localhost:7860
+        PORT=8000
+        FRONTEND_PORT=7860
+        
+        # Azure Settings
+        AZURE_LOCATION=$AZURE_LOCATION
+        RESOURCE_GROUP=rg-aifoundry-local-${AZURE_ENV_NAME}
         EOF
         
-        echo "✅ Environment variables configured"
-
-  # Pre-deploy: Validaciones antes de desplegar código
-  predeploy:
-    windows:
-      shell: pwsh
-      run: |
-        Write-Host "🔍 Pre-deployment validation..." -ForegroundColor Yellow
+        # Copy to subdirectories
+        cp .env backend/.env
+        cp .env frontend/.env
         
-        # Verificar que .env existe
-        if (-not (Test-Path ".env")) {
-            Write-Error ".env file not found! Run 'azd provision' first."
-            exit 1
-        }
-        
-        # Verificar que las imágenes Docker se pueden construir
-        Write-Host "🐳 Validating Docker builds..." -ForegroundColor Yellow
-        
-        docker build -t backend-test ./backend
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "Backend Docker build failed!"
-            exit 1
-        }
-        
-        docker build -t frontend-test ./frontend
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "Frontend Docker build failed!"
-            exit 1
-        }
-        
-        Write-Host "✅ Pre-deployment validation passed" -ForegroundColor Green
-    posix:
-      shell: sh
-      run: |
-        echo "🔍 Pre-deployment validation..."
-        
-        # Verificar que .env existe
-        if [ ! -f ".env" ]; then
-            echo "Error: .env file not found! Run 'azd provision' first."
-            exit 1
-        fi
-        
-        # Verificar que las imágenes Docker se pueden construir
-        echo "🐳 Validating Docker builds..."
-        
-        docker build -t backend-test ./backend || {
-            echo "Error: Backend Docker build failed!"
-            exit 1
-        }
-        
-        docker build -t frontend-test ./frontend || {
-            echo "Error: Frontend Docker build failed!"
-            exit 1
-        }
-        
-        echo "✅ Pre-deployment validation passed"
-
-  # Post-deploy: Verificaciones después del despliegue
-  postdeploy:
-    windows:
-      shell: pwsh
-      run: |
-        Write-Host "🔍 Post-deployment verification..." -ForegroundColor Yellow
-        
-        # Esperar un poco para que los servicios inicien
-        Start-Sleep -Seconds 30
-        
-        # Verificar backend health
-        $backendUri = azd env get-value BACKEND_URI
-        try {
-            $response = Invoke-WebRequest -Uri "$backendUri/health" -TimeoutSec 30
-            if ($response.StatusCode -eq 200) {
-                Write-Host "✅ Backend is healthy" -ForegroundColor Green
-            }
-        } catch {
-            Write-Warning "⚠️ Backend health check failed - this is normal if the service is still starting"
-        }
-        
-        # Verificar frontend
-        $frontendUri = azd env get-value FRONTEND_URI
-        try {
-            $response = Invoke-WebRequest -Uri $frontendUri -TimeoutSec 30
-            if ($response.StatusCode -eq 200) {
-                Write-Host "✅ Frontend is accessible" -ForegroundColor Green
-            }
-        } catch {
-            Write-Warning "⚠️ Frontend check failed - this is normal if the service is still starting"
-        }
-        
-        Write-Host "`n🎉 Deployment completed!" -ForegroundColor Green
-        Write-Host "Frontend URL: $frontendUri" -ForegroundColor Cyan
-        Write-Host "Backend Health: $backendUri/health" -ForegroundColor Cyan
-    posix:
-      shell: sh
-      run: |
-        echo "🔍 Post-deployment verification..."
-        
-        # Esperar un poco para que los servicios inicien
-        sleep 30
-        
-        # Verificar backend health
-        BACKEND_URI=$(azd env get-value BACKEND_URI)
-        if curl -f "$BACKEND_URI/health" -m 30 2>/dev/null; then
-            echo "✅ Backend is healthy"
-        else
-            echo "⚠️ Backend health check failed - this is normal if the service is still starting"
-        fi
-        
-        # Verificar frontend
-        FRONTEND_URI=$(azd env get-value FRONTEND_URI)
-        if curl -f "$FRONTEND_URI" -m 30 2>/dev/null; then
-            echo "✅ Frontend is accessible"
-        else
-            echo "⚠️ Frontend check failed - this is normal if the service is still starting"
-        fi
-        
+        echo "✅ .env files created successfully!"
         echo ""
-        echo "🎉 Deployment completed!"
-        echo "Frontend URL: $FRONTEND_URI"
-        echo "Backend Health: $BACKEND_URI/health"
+        echo "🚀 Next steps:"
+        echo "  1. Run: python setup-and-verify.py"
+        echo "  2. Start services: ./run-local.sh"
+        echo "  3. Open: http://localhost:7860"
+
+  # Pre-down hook to warn user
+  predown:
+    windows:
+      shell: pwsh
+      run: |
+        Write-Host "⚠️ WARNING: This will delete all Azure resources for local development" -ForegroundColor Yellow
+        Write-Host "  - AI Hub and Project" -ForegroundColor Yellow
+        Write-Host "  - Storage Account (including all stored images)" -ForegroundColor Yellow
+        Write-Host "  - Key Vault" -ForegroundColor Yellow
+        Write-Host ""
+        $response = Read-Host "Are you sure you want to continue? (yes/no)"
+        if ($response -ne "yes") {
+            Write-Host "❌ Operation cancelled" -ForegroundColor Red
+            exit 1
+        }
+    posix:
+      shell: sh
+      run: |
+        echo "⚠️ WARNING: This will delete all Azure resources for local development"
+        echo "  - AI Hub and Project"
+        echo "  - Storage Account (including all stored images)"
+        echo "  - Key Vault"
+        echo ""
+        read -p "Are you sure you want to continue? (yes/no): " response
+        if [ "$response" != "yes" ]; then
+            echo "❌ Operation cancelled"
+            exit 1
+        fi

@@ -1,8 +1,6 @@
 # ================================================
-# AUTOMATED LOCAL DEVELOPMENT SETUP FOR WINDOWS - FIXED VERSION
+# AUTOMATED LOCAL DEVELOPMENT SETUP FOR WINDOWS
 # ================================================
-# This script provisions minimal Azure resources for local development
-# and sets up the complete local environment automatically
 
 $ErrorActionPreference = "Stop"
 
@@ -23,267 +21,163 @@ function Test-Prerequisites {
     $allOk = $true
     
     # Check Azure CLI
-    if (Get-Command az -ErrorAction SilentlyContinue) {
-        Write-Host "OK: Azure CLI installed" -ForegroundColor Green
-    } else {
+    try {
+        $azVersion = az version --output json | ConvertFrom-Json
+        Write-Host "OK: Azure CLI installed (version $($azVersion.'azure-cli'))" -ForegroundColor Green
+    } catch {
         Write-Host "ERROR: Azure CLI not installed" -ForegroundColor Red
         Write-Host "Install from: https://docs.microsoft.com/cli/azure/install" -ForegroundColor Yellow
         $allOk = $false
     }
     
     # Check Python
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        Write-Host "OK: Python installed" -ForegroundColor Green
-    } else {
+    try {
+        $pythonVersion = python --version 2>&1
+        Write-Host "OK: Python installed ($pythonVersion)" -ForegroundColor Green
+    } catch {
         Write-Host "ERROR: Python not installed" -ForegroundColor Red
-        Write-Host "Install from: https://www.python.org/downloads/" -ForegroundColor Yellow
         $allOk = $false
     }
     
-    # Check if bicep is installed (part of Azure CLI)
-    try {
-        az bicep version | Out-Null
-        Write-Host "OK: Bicep installed" -ForegroundColor Green
-    } catch {
-        Write-Host "WARNING: Installing Bicep..." -ForegroundColor Yellow
-        az bicep install
-    }
+    # Install/update Bicep
+    Write-Host "Checking Bicep..." -ForegroundColor Yellow
+    az bicep upgrade 2>&1 | Out-Null
+    Write-Host "OK: Bicep ready" -ForegroundColor Green
     
-    if (-not $allOk) {
-        Write-Host "`nPlease install missing prerequisites and try again" -ForegroundColor Red
-        exit 1
-    }
+    return $allOk
 }
 
-# Azure authentication
-function Connect-AzureAccount {
-    Write-Host "`nAzure Authentication" -ForegroundColor Cyan
-    Write-Host ("=" * 50) -ForegroundColor Cyan
+# Register Resource Providers
+function Register-ResourceProviders {
+    Write-Host "`nRegistering Azure Resource Providers..." -ForegroundColor Cyan
     
-    # Check if already logged in
-    $account = az account show 2>$null | ConvertFrom-Json
-    if ($account) {
-        Write-Host "Already logged in as: $($account.user.name)" -ForegroundColor Green
-        Write-Host "Subscription: $($account.name)" -ForegroundColor Blue
+    $providers = @(
+        "Microsoft.MachineLearningServices",
+        "Microsoft.Storage",
+        "Microsoft.KeyVault",
+        "Microsoft.Insights",
+        "Microsoft.OperationalInsights"
+    )
+    
+    foreach ($provider in $providers) {
+        Write-Host "  Checking $provider..." -ForegroundColor Gray
+        $state = az provider show --namespace $provider --query "registrationState" -o tsv 2>$null
         
-        $continue = Read-Host "Do you want to continue with this account? (y/n)"
-        if ($continue -ne 'y') {
-            az logout
-            az login
-        }
-    } else {
-        Write-Host "Not logged in to Azure" -ForegroundColor Yellow
-        az login
-    }
-}
-
-# Get deployment parameters
-function Get-DeploymentParameters {
-    Write-Host "`nConfiguration Parameters" -ForegroundColor Cyan
-    Write-Host ("=" * 50) -ForegroundColor Cyan
-    
-    # Environment name
-    $envName = Read-Host "Environment name (default: $DEFAULT_ENV_NAME)"
-    if (-not $envName) { $envName = $DEFAULT_ENV_NAME }
-    
-    # Azure location
-    Write-Host "Available regions: eastus, westus2, westeurope, swedencentral, northeurope, uksouth" -ForegroundColor Blue
-    $location = Read-Host "Azure location (default: $DEFAULT_LOCATION)"
-    if (-not $location) { $location = $DEFAULT_LOCATION }
-    
-    # Resource group name
-    $rgName = "rg-aifoundry-local-$envName"
-    $customRg = Read-Host "Resource group name (default: $rgName)"
-    if ($customRg) { $rgName = $customRg }
-    
-    Write-Host "`nConfiguration summary:" -ForegroundColor Blue
-    Write-Host "   Environment: $envName"
-    Write-Host "   Location: $location"
-    Write-Host "   Resource Group: $rgName"
-    
-    $proceed = Read-Host "`nProceed with these settings? (y/n)"
-    if ($proceed -ne 'y') {
-        Write-Host "Setup cancelled" -ForegroundColor Yellow
-        exit 1
-    }
-    
-    return @{
-        EnvName = $envName
-        Location = $location
-        ResourceGroup = $rgName
-    }
-}
-
-# Create resources using Bicep directly
-function Deploy-AzureResources {
-    param($Config)
-    
-    Write-Host "`nProvisioning Azure Resources" -ForegroundColor Cyan
-    Write-Host ("=" * 50) -ForegroundColor Cyan
-    
-    Write-Host "This will create:" -ForegroundColor Blue
-    Write-Host "   - AI Hub and Project"
-    Write-Host "   - Storage Account"
-    Write-Host "   - Key Vault"
-    Write-Host "   - Application Insights"
-    Write-Host ""
-    Write-Host "This may take 5-10 minutes..." -ForegroundColor Yellow
-    
-    # Create resource group
-    Write-Host "`nCreating resource group..." -ForegroundColor Yellow
-    
-    # Check if resource group exists
-    $rgExists = az group exists --name $Config.ResourceGroup 2>$null
-    
-    if ($rgExists -eq "false") {
-        az group create --name $Config.ResourceGroup --location $Config.Location --output none
-        
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "Resource group created: $($Config.ResourceGroup)" -ForegroundColor Green
+        if ($state -ne "Registered") {
+            Write-Host "    Registering $provider..." -ForegroundColor Yellow
+            az provider register --namespace $provider --wait
         } else {
-            Write-Host "Failed to create resource group" -ForegroundColor Red
-            exit 1
+            Write-Host "    ✅ $provider already registered" -ForegroundColor Green
+        }
+    }
+}
+
+# Function to get deployment outputs and create .env
+function Create-EnvFile {
+    param(
+        [string]$ResourceGroup,
+        [string]$Location,
+        [string]$DeploymentName
+    )
+    
+    Write-Host "`nRetrieving resource information..." -ForegroundColor Yellow
+    
+    # Inicializar variables
+    $STORAGE_ACCOUNT_NAME = ""
+    $STORAGE_ACCOUNT_KEY = ""
+    $KEY_VAULT_NAME = ""
+    $AI_HUB_NAME = ""
+    $AI_PROJECT_NAME = ""
+    $PROJECT_ENDPOINT = ""
+    
+    # Get Storage Account
+    $storageAccounts = az storage account list `
+        --resource-group $ResourceGroup `
+        --output json 2>$null | ConvertFrom-Json
+    
+    if ($storageAccounts -and $storageAccounts.Count -gt 0) {
+        $STORAGE_ACCOUNT_NAME = $storageAccounts[0].name
+        Write-Host "  Found Storage: $STORAGE_ACCOUNT_NAME" -ForegroundColor Green
+        
+        # Get Storage Key
+        $STORAGE_ACCOUNT_KEY = az storage account keys list `
+            --account-name $STORAGE_ACCOUNT_NAME `
+            --resource-group $ResourceGroup `
+            --query "[0].value" `
+            -o tsv 2>$null
+    } else {
+        Write-Host "  Storage Account not found - critical resource missing" -ForegroundColor Red
+        $STORAGE_ACCOUNT_NAME = "PENDING_MANUAL_CREATION"
+        $STORAGE_ACCOUNT_KEY = "PENDING_MANUAL_CREATION"
+    }
+    
+    # Get Key Vault
+    $keyVaults = az keyvault list `
+        --resource-group $ResourceGroup `
+        --output json 2>$null | ConvertFrom-Json
+    
+    if ($keyVaults -and $keyVaults.Count -gt 0) {
+        $KEY_VAULT_NAME = $keyVaults[0].name
+        Write-Host "  Found Key Vault: $KEY_VAULT_NAME" -ForegroundColor Green
+    } else {
+        Write-Host "  Key Vault not found - will need manual creation" -ForegroundColor Yellow
+        $KEY_VAULT_NAME = "PENDING_MANUAL_CREATION"
+    }
+    
+    # Get AI Hub and Project
+    Write-Host "  Checking for ML workspaces..." -ForegroundColor Gray
+    $mlWorkspaces = az ml workspace list `
+        --resource-group $ResourceGroup `
+        --output json 2>$null | ConvertFrom-Json
+    
+    if ($mlWorkspaces -and $mlWorkspaces.Count -gt 0) {
+        foreach ($workspace in $mlWorkspaces) {
+            if ($workspace.kind -eq "Hub") {
+                $AI_HUB_NAME = $workspace.name
+                Write-Host "  Found AI Hub: $AI_HUB_NAME" -ForegroundColor Green
+            } elseif ($workspace.kind -eq "Project") {
+                $AI_PROJECT_NAME = $workspace.name
+                Write-Host "  Found AI Project: $AI_PROJECT_NAME" -ForegroundColor Green
+            }
         }
     } else {
-        Write-Host "Resource group already exists: $($Config.ResourceGroup)" -ForegroundColor Green
+        Write-Host "  No ML workspaces found" -ForegroundColor Yellow
     }
     
-    # Deploy using Bicep
-    Write-Host "`nDeploying resources with Bicep..." -ForegroundColor Yellow
-    Write-Host "This will take several minutes, please be patient..." -ForegroundColor Gray
-    
-    $deploymentName = "local-dev-$(Get-Date -Format 'yyyyMMddHHmmss')"
-    
-    # Crear archivo temporal de parametros
-    $parametersContent = @{
-        '$schema' = "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#"
-        "contentVersion" = "1.0.0.0"
-        "parameters" = @{
-            "location" = @{ "value" = $Config.Location }
-            "environmentName" = @{ "value" = $Config.EnvName }
-        }
-    } | ConvertTo-Json -Depth 10
-    
-    $parametersFile = "$env:TEMP\deployment-params.json"
-    $parametersContent | Out-File -FilePath $parametersFile -Encoding UTF8
-    
-    Write-Host "Deployment name: $deploymentName" -ForegroundColor Gray
-    
-    # Ejecutar el despliegue con manejo especial de warnings
-    $originalErrorActionPreference = $ErrorActionPreference
-    $ErrorActionPreference = "SilentlyContinue"
-    
-    # Ejecutar despliegue y capturar toda la salida
-    $deploymentOutput = & az deployment group create `
-        --name $deploymentName `
-        --resource-group $Config.ResourceGroup `
-        --template-file "infra/main-local.bicep" `
-        --parameters "@$parametersFile" `
-        --output json 2>&1
-    
-    # Restaurar configuración original
-    $ErrorActionPreference = $originalErrorActionPreference
-    
-    # Limpiar archivo temporal
-    Remove-Item $parametersFile -Force -ErrorAction SilentlyContinue
-    
-    # Filtrar la salida para obtener solo el JSON
-    $jsonLines = @()
-    $inJson = $false
-    
-    foreach ($line in $deploymentOutput) {
-        $lineStr = $line.ToString()
-        
-        # Ignorar warnings
-        if ($lineStr -like "*WARNING*" -or $lineStr -like "*Warning*") {
-            continue
-        }
-        
-        # Detectar inicio del JSON
-        if ($lineStr.StartsWith("{")) {
-            $inJson = $true
-        }
-        
-        if ($inJson) {
-            $jsonLines += $lineStr
-        }
-        
-        # Detectar fin del JSON
-        if ($lineStr.EndsWith("}") -and $inJson) {
-            break
-        }
+    if (-not $AI_HUB_NAME -or $AI_HUB_NAME -eq "") {
+        Write-Host "  AI Hub not found - will need manual creation" -ForegroundColor Yellow
+        $AI_HUB_NAME = "PENDING_MANUAL_CREATION"
     }
     
-    $jsonResult = $jsonLines -join "`n"
-    
-    # Intentar parsear el resultado
-    $deploymentSuccess = $false
-    $deployment = $null
-    
-    try {
-        if ($jsonResult -and $jsonResult.Trim() -ne "") {
-            $deployment = $jsonResult | ConvertFrom-Json
-            if ($deployment -and $deployment.properties -and $deployment.properties.provisioningState -eq "Succeeded") {
-                $deploymentSuccess = $true
-            }
-        }
-    } catch {
-        Write-Host "Could not parse deployment output directly, checking status..." -ForegroundColor Yellow
+    if (-not $AI_PROJECT_NAME -or $AI_PROJECT_NAME -eq "") {
+        Write-Host "  AI Project not found - will need manual creation" -ForegroundColor Yellow
+        $AI_PROJECT_NAME = "PENDING_MANUAL_CREATION"
+        $PROJECT_ENDPOINT = "PENDING_MANUAL_CONFIGURATION"
+    } else {
+        # Construct project endpoint
+        $PROJECT_ENDPOINT = "https://${Location}.api.azureml.ms/discovery/workspaces/${AI_PROJECT_NAME}"
+        Write-Host "  Project endpoint constructed: $PROJECT_ENDPOINT" -ForegroundColor Gray
     }
     
-    # Si no pudimos obtener el resultado directamente, verificar el estado
-    if (-not $deploymentSuccess) {
-        Write-Host "Verifying deployment status..." -ForegroundColor Yellow
-        
-        # Esperar un momento para que Azure registre el despliegue
-        Start-Sleep -Seconds 5
-        
-        $checkResult = az deployment group show `
-            --name $deploymentName `
-            --resource-group $Config.ResourceGroup `
-            --output json 2>$null
-        
-        if ($checkResult) {
-            try {
-                $deployment = $checkResult | ConvertFrom-Json
-                if ($deployment.properties.provisioningState -eq "Succeeded") {
-                    $deploymentSuccess = $true
-                }
-            } catch {
-                Write-Host "Error parsing deployment status" -ForegroundColor Red
-            }
-        }
-    }
+    Write-Host "`nCreating .env file..." -ForegroundColor Yellow
     
-    if ($deploymentSuccess) {
-        Write-Host "Azure resources provisioned successfully!" -ForegroundColor Green
-        
-        # Obtener outputs si no los tenemos
-        if (-not $deployment.properties.outputs) {
-            Write-Host "Retrieving deployment outputs..." -ForegroundColor Yellow
-            $deployment = az deployment group show `
-                --name $deploymentName `
-                --resource-group $Config.ResourceGroup `
-                --output json | ConvertFrom-Json
-        }
-        
-        $outputs = $deployment.properties.outputs
-        
-        # Create .env file with proper formatting
-        $envContent = @"
+    # Create .env content
+    $envContent = @"
 # ================================================
 # AUTO-GENERATED CONFIGURATION FOR LOCAL DEVELOPMENT
 # Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+# Resource Group: $ResourceGroup
+# Location: $Location
 # ================================================
 
 # Azure AI Foundry
-PROJECT_ENDPOINT=$($outputs.PROJECT_ENDPOINT.value)
+PROJECT_ENDPOINT=$PROJECT_ENDPOINT
 MODEL_DEPLOYMENT_NAME=gpt-4o
 AGENT_NAME=math-tutor-agent
 
 # Azure Storage
-STORAGE_ACCOUNT_NAME=$($outputs.STORAGE_ACCOUNT_NAME.value)
-STORAGE_ACCOUNT_KEY=$($outputs.STORAGE_ACCOUNT_KEY.value)
+STORAGE_ACCOUNT_NAME=$STORAGE_ACCOUNT_NAME
+STORAGE_ACCOUNT_KEY=$STORAGE_ACCOUNT_KEY
 IMAGES_CONTAINER_NAME=images
 
 # Local Development Settings
@@ -298,125 +192,369 @@ PORT=8000
 FRONTEND_PORT=7860
 
 # Azure Settings
-AZURE_LOCATION=$($Config.Location)
-RESOURCE_GROUP=$($Config.ResourceGroup)
-KEY_VAULT_NAME=$($outputs.KEY_VAULT_NAME.value)
-AI_HUB_NAME=$($outputs.AI_HUB_NAME.value)
-AI_PROJECT_NAME=$($outputs.AI_PROJECT_NAME.value)
+AZURE_LOCATION=$Location
+RESOURCE_GROUP=$ResourceGroup
+KEY_VAULT_NAME=$KEY_VAULT_NAME
+AI_HUB_NAME=$AI_HUB_NAME
+AI_PROJECT_NAME=$AI_PROJECT_NAME
 "@
+    
+    # Save .env file
+    $envContent | Out-File -FilePath ".env" -Encoding UTF8 -NoNewline
+    Write-Host "✅ .env created in root directory" -ForegroundColor Green
+    
+    # Copy only to backend (frontend doesn't need it)
+    if (Test-Path "backend") {
+        Copy-Item ".env" "backend\.env" -Force
+        Write-Host "✅ .env copied to backend\" -ForegroundColor Green
+    }
+    
+    Write-Host "✅ Configuration files created successfully!" -ForegroundColor Green
+    Write-Host "  Note: Frontend uses default localhost:8000 for backend connection" -ForegroundColor Gray
+    
+    # Verify container exists only if we have valid storage
+    if ($STORAGE_ACCOUNT_NAME -and $STORAGE_ACCOUNT_KEY -and 
+        $STORAGE_ACCOUNT_NAME -ne "PENDING_MANUAL_CREATION" -and 
+        $STORAGE_ACCOUNT_KEY -ne "PENDING_MANUAL_CREATION") {
         
-        # Save .env files
-        $envContent | Out-File -FilePath ".env" -Encoding UTF8 -NoNewline
+        Write-Host "`nVerifying images container..." -ForegroundColor Yellow
+        $containerExists = az storage container exists `
+            --name images `
+            --account-name $STORAGE_ACCOUNT_NAME `
+            --account-key $STORAGE_ACCOUNT_KEY `
+            --query "exists" `
+            -o tsv 2>$null
         
-        # Copy to subdirectories
-        if (Test-Path "backend") {
-            Copy-Item ".env" "backend\.env" -Force
-            Write-Host ".env copied to backend\" -ForegroundColor Green
-        }
-        
-        if (Test-Path "frontend") {
-            Copy-Item ".env" "frontend\.env" -Force
-            Write-Host ".env copied to frontend\" -ForegroundColor Green
-        }
-        
-        Write-Host ".env files created successfully!" -ForegroundColor Green
-        
-    } else {
-        Write-Host "Deployment appears to have failed or is still in progress." -ForegroundColor Yellow
-        Write-Host "Please check the Azure portal for details:" -ForegroundColor Yellow
-        Write-Host "  Resource Group: $($Config.ResourceGroup)" -ForegroundColor White
-        Write-Host ""
-        Write-Host "You can also run check-deployment.ps1 to verify the status later." -ForegroundColor Cyan
-        
-        if ($deployment -and $deployment.properties) {
-            Write-Host "Current status: $($deployment.properties.provisioningState)" -ForegroundColor Yellow
+        if ($containerExists -ne "true") {
+            Write-Host "Creating 'images' container..." -ForegroundColor Yellow
+            az storage container create `
+                --name images `
+                --account-name $STORAGE_ACCOUNT_NAME `
+                --account-key $STORAGE_ACCOUNT_KEY `
+                --public-access blob `
+                --output none 2>$null
             
-            if ($deployment.properties.error) {
-                Write-Host "Error: $($deployment.properties.error.message)" -ForegroundColor Red
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "✅ Container 'images' created" -ForegroundColor Green
+            } else {
+                Write-Host "⚠️ Could not create container" -ForegroundColor Yellow
             }
-        }
-    }
-}
-
-# Setup Python environment
-function Setup-PythonEnvironment {
-    param($Config)
-    
-    Write-Host "`nSetting up Python environment..." -ForegroundColor Cyan
-    Write-Host ("=" * 50) -ForegroundColor Cyan
-    
-    # Check if setup-and-verify.py exists
-    if (Test-Path "setup-and-verify.py") {
-        Write-Host "Running Python setup script..." -ForegroundColor Yellow
-        python setup-and-verify.py
-        
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "Python environment configured!" -ForegroundColor Green
         } else {
-            Write-Host "Python setup had some issues. Check the output above." -ForegroundColor Yellow
+            Write-Host "✅ Container 'images' already exists" -ForegroundColor Green
         }
-    } else {
-        Write-Host "setup-and-verify.py not found. Manual setup may be required." -ForegroundColor Yellow
     }
+    
+    # Show summary of what needs manual creation
+    Write-Host ""
+    Write-Host "RESOURCE STATUS SUMMARY:" -ForegroundColor Cyan
+    Write-Host "========================" -ForegroundColor Cyan
+    
+    $needsManualAction = $false
+    
+    if ($STORAGE_ACCOUNT_NAME -eq "PENDING_MANUAL_CREATION") {
+        Write-Host "❌ Storage Account: Missing (critical)" -ForegroundColor Red
+        $needsManualAction = $true
+    } else {
+        Write-Host "✅ Storage Account: $STORAGE_ACCOUNT_NAME" -ForegroundColor Green
+    }
+    
+    if ($KEY_VAULT_NAME -eq "PENDING_MANUAL_CREATION") {
+        Write-Host "⚠️  Key Vault: Missing (required by AI Hub)" -ForegroundColor Yellow
+        $needsManualAction = $true
+    } else {
+        Write-Host "✅ Key Vault: $KEY_VAULT_NAME" -ForegroundColor Green
+    }
+    
+    if ($AI_HUB_NAME -eq "PENDING_MANUAL_CREATION") {
+        Write-Host "⚠️  AI Hub: Missing (required for agent)" -ForegroundColor Yellow
+        $needsManualAction = $true
+    } else {
+        Write-Host "✅ AI Hub: $AI_HUB_NAME" -ForegroundColor Green
+    }
+    
+    if ($AI_PROJECT_NAME -eq "PENDING_MANUAL_CREATION") {
+        Write-Host "⚠️  AI Project: Missing (required for agent)" -ForegroundColor Yellow
+        $needsManualAction = $true
+    } else {
+        Write-Host "✅ AI Project: $AI_PROJECT_NAME" -ForegroundColor Green
+    }
+    
+    # Provide manual action instructions if needed
+    if ($needsManualAction) {
+        Write-Host ""
+        Write-Host "⚠️ MANUAL ACTION REQUIRED:" -ForegroundColor Yellow
+        Write-Host "===========================" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Option 1: Create missing resources manually in Azure Portal" -ForegroundColor Cyan
+        Write-Host "  1. Go to: https://portal.azure.com" -ForegroundColor White
+        Write-Host "  2. Navigate to Resource Group: $ResourceGroup" -ForegroundColor White
+        
+        if ($KEY_VAULT_NAME -eq "PENDING_MANUAL_CREATION") {
+            Write-Host "  3. Create a Key Vault" -ForegroundColor White
+        }
+        
+        if ($AI_HUB_NAME -eq "PENDING_MANUAL_CREATION") {
+            Write-Host "  4. Go to Azure AI Studio: https://ai.azure.com" -ForegroundColor White
+            Write-Host "  5. Create an AI Hub in the resource group" -ForegroundColor White
+        }
+        
+        if ($AI_PROJECT_NAME -eq "PENDING_MANUAL_CREATION") {
+            Write-Host "  6. Create an AI Project inside the Hub" -ForegroundColor White
+            Write-Host "  7. Update PROJECT_ENDPOINT in .env file" -ForegroundColor White
+        }
+        
+        Write-Host ""
+        Write-Host "Option 2: Delete the resource group and retry" -ForegroundColor Cyan
+        Write-Host "  az group delete --name $ResourceGroup --yes" -ForegroundColor White
+        Write-Host "  Then run this script again" -ForegroundColor White
+    }
+    
+    return $true
 }
 
-# Display next steps
-function Show-NextSteps {
-    param($Config)
-    
-    Write-Host ""
-    Write-Host "========================================" -ForegroundColor Green
-    Write-Host "   LOCAL DEVELOPMENT SETUP COMPLETE!    " -ForegroundColor Green
-    Write-Host "========================================" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "RESOURCES CREATED IN AZURE:" -ForegroundColor Cyan
-    Write-Host "  Resource Group: $($Config.ResourceGroup)" -ForegroundColor White
-    Write-Host "  Location: $($Config.Location)" -ForegroundColor White
-    Write-Host ""
-    Write-Host "NEXT STEPS:" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "1. Start the services:" -ForegroundColor Yellow
-    Write-Host "   run-local.bat" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "2. Or run services separately:" -ForegroundColor Yellow
-    Write-Host "   Terminal 1: cd backend; .venv\Scripts\activate; python main.py" -ForegroundColor Cyan
-    Write-Host "   Terminal 2: cd frontend; .venv\Scripts\activate; python app.py" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "3. Access the application:" -ForegroundColor Yellow
-    Write-Host "   Frontend: http://localhost:7860" -ForegroundColor Cyan
-    Write-Host "   Backend API: http://localhost:8000/docs" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "USEFUL COMMANDS:" -ForegroundColor Cyan
-    Write-Host "  Check resources: az resource list --resource-group $($Config.ResourceGroup) --output table" -ForegroundColor Gray
-    Write-Host "  Check deployment: .\check-deployment.ps1" -ForegroundColor Gray
-    Write-Host "  Delete resources: az group delete --name $($Config.ResourceGroup) --yes" -ForegroundColor Gray
-    Write-Host ""
-}
 
 # Main execution
 function Main {
-    Write-Host ""
     Write-Host "This script will:" -ForegroundColor Blue
     Write-Host "   1. Check prerequisites"
     Write-Host "   2. Authenticate with Azure"
     Write-Host "   3. Provision minimal Azure resources for local dev"
     Write-Host "   4. Create all necessary .env files"
-    Write-Host "   5. Setup Python environment"
     Write-Host ""
     
     $ready = Read-Host "Ready to start? (y/n)"
     if ($ready -ne 'y') {
         Write-Host "Setup cancelled" -ForegroundColor Yellow
+        exit 0
+    }
+    
+    # Check prerequisites
+    if (-not (Test-Prerequisites)) {
+        Write-Host "`nPlease install missing prerequisites and try again" -ForegroundColor Red
         exit 1
     }
     
-    # Execute setup steps
-    Test-Prerequisites
-    Connect-AzureAccount
-    $config = Get-DeploymentParameters
-    Deploy-AzureResources -Config $config
-    Setup-PythonEnvironment -Config $config
-    Show-NextSteps -Config $config
+    # Azure authentication
+    Write-Host "`nAzure Authentication" -ForegroundColor Cyan
+    Write-Host ("=" * 50) -ForegroundColor Cyan
+    
+    $account = az account show 2>$null | ConvertFrom-Json
+    if ($account) {
+        Write-Host "Already logged in as: $($account.user.name)" -ForegroundColor Green
+        Write-Host "Subscription: $($account.name)" -ForegroundColor Blue
+        
+        $continue = Read-Host "Do you want to continue with this account? (y/n)"
+        if ($continue -ne 'y') {
+            az logout
+            az login
+        }
+    } else {
+        Write-Host "Not logged in to Azure" -ForegroundColor Yellow
+        az login
+    }
+    
+    # Register providers
+    Register-ResourceProviders
+    
+    # Get deployment parameters
+    Write-Host "`nConfiguration Parameters" -ForegroundColor Cyan
+    Write-Host ("=" * 50) -ForegroundColor Cyan
+    
+    $envName = Read-Host "Environment name (default: $DEFAULT_ENV_NAME)"
+    if (-not $envName) { $envName = $DEFAULT_ENV_NAME }
+    
+    Write-Host "Available regions: eastus, westus2, westeurope, swedencentral, northeurope, uksouth" -ForegroundColor Blue
+    $location = Read-Host "Azure location (default: $DEFAULT_LOCATION)"
+    if (-not $location) { $location = $DEFAULT_LOCATION }
+    
+    $rgName = "rg-aifoundry-local-$envName"
+    $customRg = Read-Host "Resource group name (default: $rgName)"
+    if ($customRg) { $rgName = $customRg }
+    
+    Write-Host "`nConfiguration summary:" -ForegroundColor Blue
+    Write-Host "   Environment: $envName"
+    Write-Host "   Location: $location"
+    Write-Host "   Resource Group: $rgName"
+    
+    $proceed = Read-Host "`nProceed with these settings? (y/n)"
+    if ($proceed -ne 'y') {
+        Write-Host "Setup cancelled" -ForegroundColor Yellow
+        exit 0
+    }
+    
+    # Create resource group
+    Write-Host "`nCreating resource group..." -ForegroundColor Yellow
+    
+    $rgExists = az group exists --name $rgName 2>$null
+    
+    if ($rgExists -eq "false") {
+        az group create `
+            --name $rgName `
+            --location $location `
+            --tags "Environment=LocalDev" "Project=MathTutor" `
+            --output none
+        
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Resource group created: $rgName" -ForegroundColor Green
+        } else {
+            Write-Host "Failed to create resource group" -ForegroundColor Red
+            exit 1
+        }
+    } else {
+        Write-Host "Resource group already exists: $rgName" -ForegroundColor Green
+    }
+    
+    # Deploy using Bicep
+    Write-Host "`nDeploying resources with Bicep..." -ForegroundColor Yellow
+    Write-Host "This will take 5-10 minutes, please be patient..." -ForegroundColor Gray
+    
+    $deploymentName = "local-dev-$(Get-Date -Format 'yyyyMMddHHmmss')"
+    Write-Host "Deployment name: $deploymentName" -ForegroundColor Gray
+    
+    # Execute deployment - capturando warnings pero sin detener el script
+    $originalErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    
+    az deployment group create `
+        --name $deploymentName `
+        --resource-group $rgName `
+        --template-file "infra/main-local.bicep" `
+        --parameters location=$location environmentName=$envName `
+        --output none 2>&1 | Out-Null
+    
+    $ErrorActionPreference = $originalErrorActionPreference
+    
+    # Check deployment status
+    Write-Host "`nChecking deployment status..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 5
+    
+    $deployment = az deployment group show `
+        --name $deploymentName `
+        --resource-group $rgName `
+        --output json 2>$null | ConvertFrom-Json
+    
+    if ($deployment -and $deployment.properties.provisioningState -eq "Succeeded") {
+        Write-Host "✅ Azure resources provisioned successfully!" -ForegroundColor Green
+        
+        # List resources created
+        Write-Host "`nResources created:" -ForegroundColor Cyan
+        $resources = az resource list --resource-group $rgName --query "[].{Name:name, Type:type}" --output table
+        Write-Host $resources
+        
+        # Create .env file with deployment outputs
+        $envCreated = Create-EnvFile -ResourceGroup $rgName -Location $location -DeploymentName $deploymentName
+        
+        if ($envCreated) {
+            # Setup Python environment
+            Write-Host "`nSetting up Python environment..." -ForegroundColor Cyan
+            Write-Host ("=" * 50) -ForegroundColor Cyan
+            
+            if (Test-Path "setup-and-verify.py") {
+                Write-Host "Running Python setup script..." -ForegroundColor Yellow
+                python setup-and-verify.py
+                
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "✅ Python environment configured!" -ForegroundColor Green
+                } else {
+                    Write-Host "⚠️ Python setup had some issues. Check the output above." -ForegroundColor Yellow
+                }
+            }
+            
+            # Show summary
+            Write-Host ""
+            Write-Host "========================================" -ForegroundColor Green
+            Write-Host "   LOCAL DEVELOPMENT SETUP COMPLETE!    " -ForegroundColor Green
+            Write-Host "========================================" -ForegroundColor Green
+            Write-Host ""
+            Write-Host "RESOURCES CREATED IN AZURE:" -ForegroundColor Cyan
+            Write-Host "  Resource Group: $rgName" -ForegroundColor White
+            Write-Host "  Location: $location" -ForegroundColor White
+            
+            # Show what's in the .env
+            Write-Host ""
+            Write-Host "CONFIGURATION (.env created):" -ForegroundColor Cyan
+            if (Test-Path ".env") {
+                $envVars = Get-Content ".env" | Where-Object { $_ -match "^[^#].*=" }
+                foreach ($line in $envVars) {
+                    if ($line -match "KEY|SECRET|PASSWORD") {
+                        $parts = $line.Split('=')
+                        Write-Host "  $($parts[0])=***" -ForegroundColor Gray
+                    } else {
+                        Write-Host "  $line" -ForegroundColor Gray
+                    }
+                }
+            }
+            
+            Write-Host ""
+            Write-Host "NEXT STEPS:" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "1. Start the services:" -ForegroundColor Yellow
+            Write-Host "   .\run-local.bat" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "2. Or run services separately:" -ForegroundColor Yellow
+            Write-Host "   Terminal 1: cd backend; .venv\Scripts\activate; python main.py" -ForegroundColor Cyan
+            Write-Host "   Terminal 2: cd frontend; .venv\Scripts\activate; python app.py" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "3. Access the application:" -ForegroundColor Yellow
+            Write-Host "   Frontend: http://localhost:7860" -ForegroundColor Cyan
+            Write-Host "   Backend API: http://localhost:8000/docs" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "USEFUL COMMANDS:" -ForegroundColor Cyan
+            Write-Host "  Check resources: az resource list --resource-group $rgName --output table" -ForegroundColor Gray
+            Write-Host "  Check deployment: .\check-deployment.ps1" -ForegroundColor Gray
+            Write-Host "  Delete resources: az group delete --name $rgName --yes" -ForegroundColor Gray
+            Write-Host ""
+        } else {
+            Write-Host "⚠️ .env file creation had issues" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "⚠️ Deployment had issues" -ForegroundColor Yellow
+        
+        if ($deployment) {
+            Write-Host "Status: $($deployment.properties.provisioningState)" -ForegroundColor Yellow
+            
+            if ($deployment.properties.error) {
+                Write-Host "Error: $($deployment.properties.error.message)" -ForegroundColor Red
+            }
+        }
+        
+        # Intentar crear .env con los recursos que se hayan creado
+        Write-Host "`nAttempting to create .env with existing resources..." -ForegroundColor Yellow
+        
+        # Verificar qué recursos existen
+        $existingResources = az resource list --resource-group $rgName --output json 2>$null | ConvertFrom-Json
+        
+        if ($existingResources -and $existingResources.Count -gt 0) {
+            Write-Host "Found $($existingResources.Count) resources in the resource group" -ForegroundColor Cyan
+            
+            foreach ($resource in $existingResources) {
+                Write-Host "  - $($resource.name) ($($resource.type))" -ForegroundColor Gray
+            }
+            
+            $envCreated = Create-EnvFile -ResourceGroup $rgName -Location $location -DeploymentName $deploymentName
+            
+            if ($envCreated) {
+                Write-Host "`n✅ .env created with available resources" -ForegroundColor Green
+                
+                # Continuar con el setup de Python
+                if (Test-Path "setup-and-verify.py") {
+                    Write-Host "`nRunning Python setup..." -ForegroundColor Yellow
+                    python setup-and-verify.py
+                }
+                
+                Write-Host ""
+                Write-Host "NEXT STEPS:" -ForegroundColor Cyan
+                Write-Host "1. Complete any manual resource creation if needed" -ForegroundColor White
+                Write-Host "2. Update .env file if PROJECT_ENDPOINT shows PENDING" -ForegroundColor White
+                Write-Host "3. Run: .\run-local.bat" -ForegroundColor White
+            }
+        } else {
+            Write-Host "❌ No resources found in resource group" -ForegroundColor Red
+        }
+        
+        Write-Host "`nYou can check the deployment in Azure Portal" -ForegroundColor Yellow
+        Write-Host "Or run: .\check-deployment.ps1" -ForegroundColor Cyan
+    }
 }
 
 # Run main function
